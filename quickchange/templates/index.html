@@ -22,10 +22,41 @@
 
 <main>
   <section id="panel-timeline">
-    <h2>场次时间轴 <span class="hint">拖动任务块调整开始时间；点击选中</span></h2>
+    <h2>场次时间轴 <span class="hint">拖动任务块调整开始时间；点击选中；选中连排后同轴叠放实测</span></h2>
     <svg id="timeline" width="1180" height="260"></svg>
     <div id="conflicts"></div>
     <div id="suggestions"></div>
+  </section>
+
+  <section id="panel-runs">
+    <h2>连排实测回放 <span class="hint">从修订开启连排，按动作打点；实测不改写基准方案</span></h2>
+    <div class="run-bar">
+      <select id="run-rev"></select>
+      <input id="run-name" placeholder="连排名称（可空）">
+      <button id="btn-run-start">开启连排</button>
+      <span class="sep"></span>
+      <select id="run-sel"></select>
+      <button id="btn-run-close" class="warn">结束连排</button>
+      <span class="sep"></span>
+      <button id="btn-run-svg">计划—实测SVG</button>
+      <button id="btn-run-record">连排记录</button>
+    </div>
+    <div class="row">
+      <section id="panel-punch">
+        <h3>动作打点 <span class="hint" id="punch-hint">选中连排与时间轴任务后打点</span></h3>
+        <div class="clock-bar">
+          演出时钟 <input id="run-clock" placeholder="mm:ss 或秒">
+          <button id="btn-clock-now" type="button">置为计划时刻</button>
+        </div>
+        <div id="run-punch"><p class="muted">未选择连排</p></div>
+      </section>
+      <section id="panel-runchecks">
+        <h3>实测检查 <span class="hint">倒序/漏项/并发/错用服装·首个偏差与等待链</span></h3>
+        <div id="run-checks"><p class="muted">未选择连排</p></div>
+      </section>
+    </div>
+    <h3>多次连排汇总 · 时长建议 <span class="hint">按服装动作与人员配置（P75），勾选后从基准派生修订</span></h3>
+    <div id="run-summary"><p class="muted">暂无已结束的连排</p></div>
   </section>
 
   <div class="row">

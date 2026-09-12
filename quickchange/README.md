@@ -22,15 +22,36 @@ python3 app.py         # 依赖 Flask（本环境装在 ../.pylibs，app.py 已�
   缺件/复用冲突；并给出改动较少的替代排法（换装位/服装师/开始时间），可一键采用。
 - **变更联动**：改场次时间或服装状态/服装车 → 仅关联任务置「待复核」，可逐个销记。
 - **修订**：任意时刻存档快照，可恢复。
-- **导出**：个人换装提示单（HTML 打印）、服装流转表（CSV）、带冲突标记的 SVG 时间线。
+- **连排实测回放**：从指定修订开启连排（基准计划冻结在连排快照中，实测不改写基准方案）；
+  按动作打点开始/完成/跳过/异常，异常与补正必须留理由，补正保留原记录；
+  同一时间轴叠放计划与实测，联动演员/服装师/换装位/服装副本占用，
+  检查时刻倒序、动作漏项、并发冲突、错用服装，并定位首个偏差及后续等待链；
+  连排结束后按服装动作×人员配置汇总多次实测（P75）给出时长建议，
+  勾选建议后从基准派生修订——只重排受影响任务，锁定节点不动。
+- **导出**：个人换装提示单（HTML 打印）、服装流转表（CSV）、带冲突标记的 SVG 时间线、
+  计划—实测叠放 SVG、带异常理由的连排记录（HTML）。
 
 ## 主要接口
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/state` | 全量状态 + 排程结果 |
+| GET | `/api/state` | 全量状态 + 排程结果 + 连排列表 |
 | POST | `/api/reschedule` | 重排（已锁不动）并返回替代排法 |
 | POST | `/api/tasks/<id>` | 拖动/改派/锁定/解锁 |
 | POST | `/api/scenes/<id>`、`/api/items/<id>` | 变更并标记关联任务待复核 |
 | POST | `/api/revisions`、`/api/revisions/<id>/restore` | 修订存档/恢复 |
-| GET | `/export/cue/<actor_id>`、`/export/flow.csv`、`/export/timeline.svg` | 三类导出 |
+| POST | `/api/runs` | 从指定修订开启连排（冻结基准计划快照） |
+| POST | `/api/runs/<id>/events` | 动作打点（开始/完成/跳过/异常；异常与补正须留理由） |
+| POST | `/api/runs/<id>/close` | 结束连排（之后只读） |
+| GET | `/api/runs/<id>` | 连排详情：基准计划、事件、实测检查与等待链 |
+| GET | `/api/runs/summary` | 多次连排汇总 → 时长建议 |
+| POST | `/api/runs/derive` | 勾选建议派生修订（只重排受影响任务，已锁不动） |
+| GET | `/export/cue/<actor_id>`、`/export/flow.csv`、`/export/timeline.svg` | 三类计划导出 |
+| GET | `/export/run/<id>/compare.svg`、`/export/run/<id>/record` | 计划—实测 SVG、连排记录 |
+
+## 测试
+
+```bash
+python3 test_regression.py   # 排程/锁定/副本占用回归
+python3 test_rehearsal.py    # 连排实测：冻结基准、打点校验、四类检查、等待链、派生修订
+```

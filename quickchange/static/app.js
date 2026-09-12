@@ -6,6 +6,8 @@ const SVGNS = "http://www.w3.org/2000/svg";
 let S = null;            // 完整状态
 let selectedTask = null; // 选中任务 id
 let drag = null;
+let R = null;            // 选中连排 {run, plan, events, analysis}
+let selectedRun = null;  // 选中连排 id
 
 const TL = { left: 90, right: 1160, top: 34, laneH: 40, width: 1180 };
 const fmt = (s) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
@@ -49,7 +51,8 @@ function renderTimeline() {
   svg.innerHTML = "";
   const laneOf = {};
   S.actors.forEach((a, i) => (laneOf[a.id] = i));
-  const h = TL.top + S.actors.length * TL.laneH + 24;
+  const laneH = R ? 46 : TL.laneH;   // 选中连排时泳道加高，同轴叠放实测
+  const h = TL.top + S.actors.length * laneH + 24;
   svg.setAttribute("height", h);
 
   // 场次条与刻度
@@ -64,34 +67,72 @@ function renderTimeline() {
   }
   // 演员泳道
   S.actors.forEach((a, i) => {
-    const y = TL.top + i * TL.laneH;
-    txt(svg, 8, y + TL.laneH / 2 + 4, a.name, { "font-size": 12, fill: "#333" });
-    el("line", { x1: TL.left, y1: y + TL.laneH, x2: TL.right, y2: y + TL.laneH, stroke: "#eee" }, svg);
+    const y = TL.top + i * laneH;
+    txt(svg, 8, y + laneH / 2 + 4, a.name, { "font-size": 12, fill: "#333" });
+    el("line", { x1: TL.left, y1: y + laneH, x2: TL.right, y2: y + laneH, stroke: "#eee" }, svg);
   });
 
   const W = S.schedule.windows;
-  // 任务块
+  // 任务块（计划）
   S.tasks.forEach((t) => {
     const w = W[t.id];
     if (!w) return;
-    const y = TL.top + laneOf[t.actor_id] * TL.laneH + 7;
+    const y = TL.top + laneOf[t.actor_id] * laneH + (R ? 4 : 7);
+    const bh = R ? 13 : 26;
     const g = el("g", { class: "tblock" + (t.locked ? " locked" : "") +
                         (t.id === selectedTask ? " selected" : ""), "data-id": t.id }, svg);
     const color = !w.ok ? "#c0392b" : t.locked ? "#7f8c8d" : t.needs_review ? "#e67e22" : "#2980b9";
     el("rect", { x: xOf(w.start), y, width: Math.max(6, xOf(w.end) - xOf(w.start)),
-                 height: 26, rx: 4, fill: color, opacity: 0.9 }, g);
-    txt(g, xOf(w.start) + 4, y + 16, `#${t.id}${t.locked ? "🔒" : ""}`, { fill: "#fff" });
+                 height: bh, rx: 4, fill: color, opacity: 0.9 }, g);
+    txt(g, xOf(w.start) + 4, y + (R ? 10 : 16), `#${t.id}${t.locked ? "🔒" : ""}`, { fill: "#fff" });
     // 截止线
-    el("line", { x1: xOf(w.deadline), y1: y - 3, x2: xOf(w.deadline), y2: y + 29,
+    el("line", { x1: xOf(w.deadline), y1: y - 3, x2: xOf(w.deadline), y2: y + bh + 3,
                  stroke: "#c0392b", "stroke-dasharray": "3 2" }, g);
     g.addEventListener("pointerdown", (ev) => startDrag(ev, t));
     g.addEventListener("click", () => { selectedTask = t.id; renderAll(); });
   });
+  // 实测条（选中连排时叠放）
+  if (R) {
+    const ivs = R.analysis.task_intervals;
+    S.tasks.forEach((t) => {
+      const w = W[t.id];
+      if (!w) return;
+      const y = TL.top + laneOf[t.actor_id] * laneH + 22;
+      const iv = ivs[String(t.id)];
+      if (iv) {
+        const late = iv[1] > w.end + 5;
+        el("rect", { x: xOf(iv[0]), y, width: Math.max(5, xOf(iv[1]) - xOf(iv[0])),
+                     height: 13, rx: 3, fill: late ? "#c0392b" : "#27ae60", opacity: 0.9 }, svg);
+        txt(svg, xOf(iv[0]) + 3, y + 10, "实测", { fill: "#fff", "font-size": 9 });
+      } else {
+        txt(svg, xOf(w.start) + 3, y + 10, "未打点", { fill: "#bbb", "font-size": 9 });
+      }
+    });
+    // 异常打点（有效、未被补正）
+    const superseded = new Set(R.events.filter((e) => e.supersedes).map((e) => e.supersedes));
+    R.events.filter((e) => e.kind === "exception" && !superseded.has(e.id)).forEach((e) => {
+      const t = S.tasks.find((x) => x.id === e.task_id);
+      if (!t) return;
+      const y = TL.top + laneOf[t.actor_id] * laneH;
+      el("path", { d: `M${xOf(e.at_sec)},${y + 40} l4,-7 l4,7 z`, fill: "#e74c3c" }, svg);
+      txt(svg, xOf(e.at_sec) + 6, y + 40, e.reason.slice(0, 14), { fill: "#c0392b", "font-size": 9 });
+    });
+    // 首个偏差
+    const fd = R.analysis.first_deviation;
+    if (fd) {
+      const t = S.tasks.find((x) => x.id === fd.task_id);
+      if (t) {
+        const y = TL.top + laneOf[t.actor_id] * laneH;
+        el("path", { d: `M${xOf(fd.time)},${y - 2} l5,8 l-10,0 z`, fill: "#e67e22" }, svg);
+        txt(svg, xOf(fd.time) + 6, y + 2, `首个偏差 #${fd.task_id}`, { fill: "#d35400", "font-size": 9 });
+      }
+    }
+  }
   // 冲突三角
   S.schedule.conflicts.forEach((c) => {
     const t = S.tasks.find((x) => x.id === c.task_id);
     if (!t) return;
-    const y = TL.top + laneOf[t.actor_id] * TL.laneH;
+    const y = TL.top + laneOf[t.actor_id] * laneH;
     const color = c.type === "review" ? "#e67e22" : "#e74c3c";
     el("path", { d: `M${xOf(c.time)},${y + 4} l5,-9 l5,9 z`, fill: color }, svg);
   });
@@ -400,7 +441,157 @@ function renderRevisions() {
   });
 }
 
-/* ---------------- 汇总渲染 ---------------- */
+/* ---------------- 连排实测 ---------------- */
+
+function renderRunBar() {
+  const rev = $("#run-rev");
+  rev.innerHTML = S.revisions.length
+    ? S.revisions.map((r) => `<option value="${r.id}">修订#${r.id} ${r.note || ""}</option>`).join("")
+    : '<option value="">（先保存修订作为基准）</option>';
+  const sel = $("#run-sel");
+  sel.innerHTML = '<option value="">不查看连排</option>' +
+    S.runs.map((r) => `<option value="${r.id}" ${r.id === selectedRun ? "selected" : ""}>` +
+      `#${r.id} ${r.name}${r.status === "open" ? "（进行中）" : "（已结束）"}</option>`).join("");
+  $("#btn-run-close").disabled = !(R && R.run.status === "open");
+}
+
+async function loadRun(id) {
+  selectedRun = id;
+  R = id ? await api(`/api/runs/${id}`) : null;
+  renderAll();
+}
+
+function parseClock() {
+  const v = $("#run-clock").value.trim();
+  let m;
+  if (/^\d+$/.test(v)) return +v;
+  if ((m = v.match(/^(\d+):(\d{1,2})$/))) return +m[1] * 60 + +m[2];
+  alert("时钟格式：mm:ss 或秒数");
+  return null;
+}
+
+async function punch(tid, idx, kind, existing) {
+  if (!R || R.run.status !== "open") return alert("连排未在进行中");
+  const at = parseClock();
+  if (at === null) return;
+  let reason = "";
+  if (kind === "exception") {
+    reason = prompt("异常理由（必填）：", "");
+    if (!reason) return alert("异常打点必须填写理由");
+  } else if (existing) {
+    reason = prompt(`补正理由（必填，原记录 ${fmt(existing.at_sec)} 保留备查）：`, "");
+    if (!reason) return alert("补正必须填写理由");
+  }
+  const res = await api(`/api/runs/${R.run.id}/events`, "POST",
+    { task_id: tid, action_idx: idx, kind, at_sec: at, reason });
+  if (res && res.ok === false) return alert(res.error || "打点被拒绝");
+  R = res.run;
+  renderAll();
+}
+
+function renderPunch() {
+  const box = $("#run-punch");
+  if (!R) { box.innerHTML = '<p class="muted">未选择连排</p>'; return; }
+  const open = R.run.status === "open";
+  const tasks = R.plan.tasks.slice().sort((a, b) =>
+    (R.plan.windows[a.id] || {}).start - (R.plan.windows[b.id] || {}).start);
+  const cur = tasks.find((t) => t.id === selectedTask) || tasks[0];
+  if (!cur) { box.innerHTML = '<p class="muted">基准计划中没有任务</p>'; return; }
+  const actor = (id) => (R.plan.actors.find((a) => a.id === id) || {}).name || "?";
+  let html = `<div class="muted">基准修订#${R.run.revision_id}｜${R.run.name}｜` +
+    `${open ? "进行中" : "已结束（只读）"}</div>`;
+  html += `<select id="punch-task">` + tasks.map((t) => {
+    const w = R.plan.windows[t.id] || {};
+    return `<option value="${t.id}" ${t.id === cur.id ? "selected" : ""}>` +
+      `#${t.id} ${actor(t.actor_id)} 计划${fmt(w.start || 0)}</option>`;
+  }).join("") + `</select>`;
+  const acts = R.plan.actions.filter((a) => a.task_id === cur.id)
+    .sort((a, b) => a.idx - b.idx);
+  const superseded = new Set(R.events.filter((e) => e.supersedes).map((e) => e.supersedes));
+  html += acts.map((a) => {
+    const ac = R.analysis.actuals[`${cur.id}:${a.idx}`] || {};
+    const eff = (k) => R.events.find((e) => e.task_id === cur.id && e.action_idx === a.idx &&
+      e.kind === k && !superseded.has(e.id));
+    const evS = eff("start"), evD = eff("done"), evK = eff("skip");
+    const exc = R.events.filter((e) => e.task_id === cur.id && e.action_idx === a.idx &&
+      e.kind === "exception" && !superseded.has(e.id));
+    const state = ac.skipped ? '<span class="tag skip">已跳过</span>'
+      : `${evS ? fmt(evS.at_sec) : "—"} → ${evD ? fmt(evD.at_sec) : "—"}`;
+    const btns = open ? ["start", "done", "skip", "exception"].map((k) => {
+      const label = { start: "开始", done: "完成", skip: "跳过", exception: "异常" }[k];
+      const ex = eff(k);
+      return `<button class="pbtn ${k}" data-t="${cur.id}" data-i="${a.idx}" data-k="${k}" ` +
+        `data-ex="${ex ? ex.at_sec : ""}">${ex ? "补正" : label}</button>`;
+    }).join("") : "";
+    const notes = exc.map((e) => `<span class="tag exc">⚑${e.reason}</span>`).join("") +
+      [evS, evD, evK].filter((e) => e && e.reason)
+        .map((e) => `<span class="tag corr">补正:${e.reason}</span>`).join("");
+    return `<div class="punch-row"><span class="pidx">${a.idx}</span>` +
+      `<span class="plabel">${a.label}</span><span class="pplan">计划 ${fmt(a.start)} (${a.dur}s)</span>` +
+      `<span class="pstate">${state}</span>${notes}<span class="pbtns">${btns}</span></div>`;
+  }).join("");
+  box.innerHTML = html;
+  const sel = $("#punch-task");
+  sel.onchange = () => { selectedTask = +sel.value; renderAll(); };
+  box.querySelectorAll(".pbtn").forEach((b) => {
+    b.onclick = () => punch(+b.dataset.t, +b.dataset.i, b.dataset.k,
+      b.dataset.ex !== "" ? { at_sec: +b.dataset.ex } : null);
+  });
+}
+
+function renderRunChecks() {
+  const box = $("#run-checks");
+  if (!R) { box.innerHTML = '<p class="muted">未选择连排</p>'; return; }
+  const ana = R.analysis;
+  let html = "";
+  const fd = ana.first_deviation;
+  html += fd
+    ? `<div class="deviation">首个偏差：任务#${fd.task_id} 动作${fd.action_idx}「${fd.label}」` +
+      ` @ ${fmt(fd.time)} — ${fd.message}</div>`
+    : '<div class="muted">暂无显著偏差（阈值 ±5s）</div>';
+  if (ana.chain.length) {
+    html += '<div class="chain"><b>后续等待链：</b><ol>' +
+      ana.chain.map((c) => `<li>[${fmt(c.time)}] ${c.message}</li>`).join("") + "</ol></div>";
+  }
+  const TYPE = { order: "时刻倒序", missing: "动作漏项", concurrency: "并发冲突", item: "错用服装" };
+  html += ana.anomalies.length
+    ? ana.anomalies.map((c) =>
+      `<div class="anomaly ${c.type}" data-t="${c.task_id}">` +
+      `<b>${TYPE[c.type] || c.type}</b> [${fmt(c.time)}] 任务#${c.task_id} ${c.message}</div>`).join("")
+    : '<div class="muted">实测检查通过 ✓</div>';
+  box.innerHTML = html;
+  box.querySelectorAll(".anomaly").forEach((d) => {
+    d.onclick = () => { selectedTask = +d.dataset.t; renderAll(); };
+  });
+}
+
+async function renderSummary() {
+  const box = $("#run-summary");
+  const res = await api("/api/runs/summary");
+  const sg = res.suggestions || [];
+  if (!sg.length) {
+    box.innerHTML = '<p class="muted">暂无建议（需要已结束的连排，且实测 P75 与基准不同）</p>';
+    return;
+  }
+  box.innerHTML = `<table class="sumtab"><tr><th></th><th>服装</th><th>动作</th><th>配置</th>` +
+    `<th>基准</th><th>建议</th><th>样本</th></tr>` + sg.map((s) =>
+      `<tr><td><input type="checkbox" class="sumchk" data-k="${s.key}"></td>` +
+      `<td>${s.item_name}</td><td>${s.action === "don" ? "穿上" : "脱下"}</td>` +
+      `<td>${s.staffed ? "有服装师" : "自助"}</td><td>${s.current}s</td>` +
+      `<td><b>${s.suggested}s</b></td><td>${s.n} 次（${s.min}–${s.max}s）</td></tr>`).join("") +
+    `</table><button id="btn-derive">勾选建议并派生修订（只重排受影响任务，已锁不动）</button>`;
+  $("#btn-derive").onclick = async () => {
+    const keys = [...box.querySelectorAll(".sumchk")].filter((c) => c.checked)
+      .map((c) => c.dataset.k);
+    if (!keys.length) return alert("请先勾选建议");
+    const res2 = await api("/api/runs/derive", "POST", { keys });
+    if (res2 && res2.ok === false) return alert(res2.error || "派生失败");
+    alert(res2.derived ? res2.derived.note : "已派生");
+    await refresh(res2);
+  };
+}
+
+
 
 function renderAll() {
   renderTimeline();
@@ -410,6 +601,10 @@ function renderAll() {
   renderConflicts();
   renderEntry();
   renderRevisions();
+  renderRunBar();
+  renderPunch();
+  renderRunChecks();
+  renderSummary();
   const sel = $("#export-actor");
   sel.innerHTML = S.actors.map((a) => `<option value="${a.id}">${a.name}</option>`).join("");
 }
@@ -422,5 +617,34 @@ $("#btn-save-rev").onclick = async () => {
 $("#btn-cue").onclick = () => window.open(`/export/cue/${$("#export-actor").value}`);
 $("#btn-flow").onclick = () => (location.href = "/export/flow.csv");
 $("#btn-svg").onclick = () => (location.href = "/export/timeline.svg?dl=1");
+
+$("#btn-run-start").onclick = async () => {
+  const rid = $("#run-rev").value;
+  if (!rid) return alert("请先保存一个修订作为连排基准");
+  const res = await api("/api/runs", "POST",
+    { revision_id: +rid, name: $("#run-name").value.trim() });
+  if (res && res.ok === false) return alert(res.error || "开启失败");
+  R = res.run;
+  selectedRun = R.run.id;
+  $("#run-name").value = "";
+  await refresh();
+};
+$("#run-sel").onchange = (ev) => loadRun(ev.target.value ? +ev.target.value : null);
+$("#btn-run-close").onclick = async () => {
+  if (!R || !confirm("结束本次连排？结束后不能再打点")) return;
+  const res = await api(`/api/runs/${R.run.id}/close`, "POST");
+  if (res && res.ok === false) return alert(res.error || "操作失败");
+  R = res.run;
+  await refresh();
+};
+$("#btn-run-svg").onclick = () =>
+  R ? window.open(`/export/run/${R.run.id}/compare.svg?dl=1`) : alert("请先选择连排");
+$("#btn-run-record").onclick = () =>
+  R ? window.open(`/export/run/${R.run.id}/record`) : alert("请先选择连排");
+$("#btn-clock-now").onclick = () => {
+  const t = S.tasks.find((x) => x.id === selectedTask);
+  const w = t && S.schedule.windows[t.id];
+  if (w) $("#run-clock").value = fmt(Math.round(w.start));
+};
 
 refresh();

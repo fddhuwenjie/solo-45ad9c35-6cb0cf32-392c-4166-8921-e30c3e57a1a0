@@ -98,6 +98,27 @@ CREATE TABLE IF NOT EXISTS revisions(
   note TEXT NOT NULL DEFAULT '',
   snapshot TEXT NOT NULL        -- JSON: {scenes,tasks,items}
 );
+CREATE TABLE IF NOT EXISTS runs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL,
+  revision_id INTEGER NOT NULL,  -- 开启连排所依据的基准修订
+  name TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'open',   -- open | done
+  plan TEXT NOT NULL DEFAULT '{}',       -- 开启时冻结的基准计划快照（动作/窗口/资源）
+  created_at REAL NOT NULL,
+  closed_at REAL
+);
+CREATE TABLE IF NOT EXISTS run_events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id INTEGER NOT NULL,
+  task_id INTEGER NOT NULL,
+  action_idx INTEGER NOT NULL,   -- 动作在任务内的序号（对应 plan.actions）
+  kind TEXT NOT NULL,            -- start | done | skip | exception
+  at_sec INTEGER NOT NULL,       -- 实测时刻（演出时钟秒）
+  reason TEXT NOT NULL DEFAULT '', -- 异常/补正理由
+  supersedes INTEGER,            -- 补正：被本事件替代的早前事件 id
+  created_at REAL NOT NULL
+);
 """
 
 
@@ -175,6 +196,14 @@ def save_revision(note, production_id=1):
         con.close()
 
 
+def get_revision(rev_id):
+    con = connect()
+    try:
+        return row(con, "SELECT * FROM revisions WHERE id=?", (rev_id,))
+    finally:
+        con.close()
+
+
 def restore_revision(rev_id):
     con = connect()
     try:
@@ -193,5 +222,72 @@ def restore_revision(rev_id):
                 )
         con.commit()
         return True
+    finally:
+        con.close()
+
+
+# ---------------- 连排实测 ----------------
+# 实测数据只追加、不改写基准方案：runs.plan 是开启连排时冻结的计划快照，
+# run_events 仅允许插入（补正通过 supersedes 链接，旧事件保留作证）。
+
+def create_run(revision_id, name, plan, production_id=1):
+    con = connect()
+    try:
+        cur = con.execute(
+            "INSERT INTO runs(production_id,revision_id,name,status,plan,created_at) "
+            "VALUES(?,?,?,'open',?,?)",
+            (production_id, revision_id, name, json.dumps(plan, ensure_ascii=False),
+             time.time()))
+        con.commit()
+        return cur.lastrowid
+    finally:
+        con.close()
+
+
+def list_runs(production_id=1):
+    con = connect()
+    try:
+        return rows(con, "SELECT id,production_id,revision_id,name,status,created_at,closed_at "
+                         "FROM runs WHERE production_id=? ORDER BY id DESC", (production_id,))
+    finally:
+        con.close()
+
+
+def get_run(run_id):
+    con = connect()
+    try:
+        return row(con, "SELECT * FROM runs WHERE id=?", (run_id,))
+    finally:
+        con.close()
+
+
+def close_run(run_id):
+    con = connect()
+    try:
+        con.execute("UPDATE runs SET status='done', closed_at=? WHERE id=? AND status='open'",
+                    (time.time(), run_id))
+        con.commit()
+        return True
+    finally:
+        con.close()
+
+
+def add_event(run_id, task_id, action_idx, kind, at_sec, reason="", supersedes=None):
+    con = connect()
+    try:
+        cur = con.execute(
+            "INSERT INTO run_events(run_id,task_id,action_idx,kind,at_sec,reason,supersedes,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (run_id, task_id, action_idx, kind, int(at_sec), reason, supersedes, time.time()))
+        con.commit()
+        return cur.lastrowid
+    finally:
+        con.close()
+
+
+def run_events(run_id):
+    con = connect()
+    try:
+        return rows(con, "SELECT * FROM run_events WHERE run_id=? ORDER BY id", (run_id,))
     finally:
         con.close()

@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from flask import Flask, Response, jsonify, render_template, request
 
 import db
+import rehearsal
 import scheduler
 
 app = Flask(__name__)
@@ -35,6 +36,7 @@ def full_state():
     state = db.load_state(PID)
     sched = scheduler.compute_schedule(state)
     state["schedule"] = sched
+    state["runs"] = db.list_runs(PID)
     return state
 
 
@@ -226,6 +228,110 @@ def api_restore_revision(rid):
     return jsonify(full_state())
 
 
+# ---------------- 连排实测 ----------------
+
+def _run_detail(run_id):
+    run = db.get_run(run_id)
+    if not run:
+        return None
+    events = db.run_events(run_id)
+    return {"run": {k: run[k] for k in
+                    ("id", "revision_id", "name", "status", "created_at", "closed_at")},
+            "plan": rehearsal.load_plan(run),
+            "events": events,
+            "analysis": rehearsal.analyze(run, events)}
+
+
+@app.post("/api/runs")
+def api_run_create():
+    """从指定修订开启一次连排：冻结该修订的基准计划，不改写当前方案。"""
+    data = request.get_json(force=True)
+    rev = db.get_revision(int(data.get("revision_id", 0)))
+    if not rev:
+        return jsonify({"ok": False, "error": "基准修订不存在，请先保存修订"}), 404
+    snap = json.loads(rev["snapshot"])
+    plan = rehearsal.freeze_plan(db.load_state(PID), snap)
+    name = data.get("name") or f"连排·修订#{rev['id']}"
+    run_id = db.create_run(rev["id"], name, plan, PID)
+    return jsonify({"ok": True, "id": run_id, "run": _run_detail(run_id)})
+
+
+@app.get("/api/runs/<int:run_id>")
+def api_run_get(run_id):
+    d = _run_detail(run_id)
+    if not d:
+        return jsonify({"ok": False, "error": "连排不存在"}), 404
+    return jsonify(d)
+
+
+EVENT_KINDS = ("start", "done", "skip", "exception")
+
+
+@app.post("/api/runs/<int:run_id>/events")
+def api_run_event(run_id):
+    """按动作打点：开始/完成/跳过/异常。异常与补正（覆盖已有打点）必须留理由。"""
+    run = db.get_run(run_id)
+    if not run:
+        return jsonify({"ok": False, "error": "连排不存在"}), 404
+    if run["status"] != "open":
+        return jsonify({"ok": False, "error": "连排已结束，不能再打点"}), 409
+    data = request.get_json(force=True)
+    kind = data.get("kind")
+    reason = (data.get("reason") or "").strip()
+    if kind not in EVENT_KINDS:
+        return jsonify({"ok": False, "error": "未知打点类型"}), 400
+    plan = rehearsal.load_plan(run)
+    try:
+        tid, idx = int(data.get("task_id")), int(data.get("action_idx"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "缺少任务或动作序号"}), 400
+    act = next((a for a in plan["actions"] if a["task_id"] == tid and a["idx"] == idx), None)
+    if not act:
+        return jsonify({"ok": False, "error": "动作不在本次连排基准计划中"}), 404
+    try:
+        at_sec = int(data.get("at_sec"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "时刻必须是整数秒"}), 400
+    if not 0 <= at_sec <= 86400:
+        return jsonify({"ok": False, "error": "时刻超出合理范围"}), 400
+    if kind == "exception" and not reason:
+        return jsonify({"ok": False, "error": "异常打点必须填写理由"}), 400
+    events = db.run_events(run_id)
+    prev = rehearsal.effective_events(events).get((tid, idx, kind))
+    if prev and not reason:
+        return jsonify({"ok": False,
+                        "error": "补正已有打点必须填写理由（原记录保留备查）"}), 400
+    db.add_event(run_id, tid, idx, kind, at_sec, reason,
+                 supersedes=prev["id"] if prev else None)
+    return jsonify({"ok": True, "run": _run_detail(run_id)})
+
+
+@app.post("/api/runs/<int:run_id>/close")
+def api_run_close(run_id):
+    if not db.get_run(run_id):
+        return jsonify({"ok": False, "error": "连排不存在"}), 404
+    db.close_run(run_id)
+    return jsonify({"ok": True, "run": _run_detail(run_id)})
+
+
+@app.get("/api/runs/summary")
+def api_run_summary():
+    """汇总多次已结束连排，给出服装用时建议。"""
+    return jsonify({"suggestions": rehearsal.summarize_suggestions(db.load_state(PID), PID)})
+
+
+@app.post("/api/runs/derive")
+def api_run_derive():
+    """勾选建议 → 从基准派生修订：只重排受影响任务，锁定节点不动。"""
+    data = request.get_json(force=True)
+    result = rehearsal.derive_revision(data.get("keys", []), PID)
+    if not result:
+        return jsonify({"ok": False, "error": "没有可应用的建议"}), 400
+    out = full_state()
+    out["derived"] = result
+    return jsonify(out)
+
+
 # ---------------- 导出 ----------------
 
 def _task_detail(state, sched, tid):
@@ -365,6 +471,170 @@ def export_timeline_svg():
 
 def _xml(s):
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# ---------------- 连排导出 ----------------
+
+@app.get("/export/run/<int:run_id>/compare.svg")
+def export_run_compare_svg(run_id):
+    """计划—实测叠放 SVG：每个演员泳道内上为计划、下为实测，标出异常与首个偏差。"""
+    d = _run_detail(run_id)
+    if not d:
+        return "连排不存在", 404
+    plan, ana = d["plan"], d["analysis"]
+    tasks = {t["id"]: t for t in plan["tasks"]}
+    lanes = [a for a in plan["actors"] if any(t["actor_id"] == a["id"] for t in plan["tasks"])]
+    total = max((s["start_sec"] + s["duration_sec"] for s in plan["scenes"]), default=600) + 60
+    scale = 900.0 / max(total, 1)
+    lane_h, top = 52, 34
+    h = top + lane_h * len(lanes) + 46
+    lane_of = {a["id"]: i for i, a in enumerate(lanes)}
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="960" height="{h}" '
+             f'font-family="sans-serif" font-size="11">',
+             f'<rect width="960" height="{h}" fill="#fff"/>']
+    for s in plan["scenes"]:
+        x = 40 + s["start_sec"] * scale
+        parts.append(f'<rect x="{x:.1f}" y="8" width="{s["duration_sec"]*scale:.1f}" '
+                     f'height="14" fill="#dde6f2"/>')
+        parts.append(f'<text x="{x+2:.1f}" y="19" fill="#334">{_xml(s["name"])}</text>')
+    for a in lanes:
+        y = top + lane_of[a["id"]] * lane_h
+        parts.append(f'<text x="2" y="{y+26}">{_xml(a["name"])}</text>')
+        parts.append(f'<line x1="40" y1="{y+lane_h}" x2="950" y2="{y+lane_h}" stroke="#eee"/>')
+    ivs = ana["task_intervals"]
+    for tid, w in plan["windows"].items():
+        t = tasks.get(tid)
+        if not t or t["actor_id"] not in lane_of:
+            continue
+        y = top + lane_of[t["actor_id"]] * lane_h
+        x = 40 + w["start"] * scale
+        wdt = max(3, (w["end"] - w["start"]) * scale)
+        color = "#7f8c8d" if t["locked"] else "#2980b9"
+        parts.append(f'<rect x="{x:.1f}" y="{y+4}" width="{wdt:.1f}" height="13" rx="2" '
+                     f'fill="{color}" opacity="0.85"/>')
+        parts.append(f'<text x="{x+2:.1f}" y="{y+14}" fill="#fff" font-size="9">#{tid}计划</text>')
+        dx = 40 + w["deadline"] * scale
+        parts.append(f'<line x1="{dx:.1f}" y1="{y+2}" x2="{dx:.1f}" y2="{y+36}" '
+                     f'stroke="#c0392b" stroke-dasharray="3 2"/>')
+        iv = ivs.get(str(tid))
+        if iv:
+            ax = 40 + iv[0] * scale
+            aw = max(3, (iv[1] - iv[0]) * scale)
+            late = iv[1] > w["end"] + rehearsal.DEVIATION_SEC
+            acolor = "#c0392b" if late else "#27ae60"
+            parts.append(f'<rect x="{ax:.1f}" y="{y+21}" width="{aw:.1f}" height="13" rx="2" '
+                         f'fill="{acolor}" opacity="0.9"/>')
+            parts.append(f'<text x="{ax+2:.1f}" y="{y+31}" fill="#fff" font-size="9">实测</text>')
+        else:
+            parts.append(f'<text x="{x+2:.1f}" y="{y+31}" fill="#bbb" font-size="9">未打点</text>')
+    # 异常打点（含理由）与首个偏差
+    for e in d["events"]:
+        if e["kind"] != "exception" or e["task_id"] not in tasks:
+            continue
+        t = tasks[e["task_id"]]
+        if t["actor_id"] not in lane_of:
+            continue
+        y = top + lane_of[t["actor_id"]] * lane_h
+        x = 40 + e["at_sec"] * scale
+        parts.append(f'<path d="M{x:.1f},{y+38} l4,-6 l4,6 z" fill="#e74c3c"/>')
+        parts.append(f'<text x="{x+6:.1f}" y="{y+38}" fill="#c0392b" font-size="9">'
+                     f'{_xml(e["reason"][:20])}</text>')
+    fd = ana["first_deviation"]
+    if fd and fd["task_id"] in tasks and tasks[fd["task_id"]]["actor_id"] in lane_of:
+        t = tasks[fd["task_id"]]
+        y = top + lane_of[t["actor_id"]] * lane_h
+        x = 40 + fd["time"] * scale
+        parts.append(f'<path d="M{x:.1f},{y-2} l5,8 l-10,0 z" fill="#e67e22"/>')
+        parts.append(f'<text x="{x+6:.1f}" y="{y+2}" fill="#d35400" font-size="9">'
+                     f'首个偏差 #{fd["task_id"]} {_xml(fd["label"])}</text>')
+    ly = h - 30
+    parts.append(f'<rect x="40" y="{ly}" width="12" height="12" fill="#2980b9"/>'
+                 f'<text x="56" y="{ly+10}">计划</text>'
+                 f'<rect x="100" y="{ly}" width="12" height="12" fill="#27ae60"/>'
+                 f'<text x="116" y="{ly+10}">实测(按时)</text>'
+                 f'<rect x="190" y="{ly}" width="12" height="12" fill="#c0392b"/>'
+                 f'<text x="206" y="{ly+10}">实测(超时)</text>'
+                 f'<path d="M300,{ly+12} l4,-8 l4,8 z" fill="#e74c3c"/>'
+                 f'<text x="312" y="{ly+10}">异常(附理由)</text>'
+                 f'<path d="M400,{ly+2} l5,8 l-10,0 z" fill="#e67e22"/>'
+                 f'<text x="410" y="{ly+10}">首个偏差</text>')
+    parts.append(f'<text x="40" y="{h-8}" fill="#888" font-size="10">'
+                 f'{_xml(d["run"]["name"])} · 基准修订#{d["run"]["revision_id"]}</text>')
+    parts.append("</svg>")
+    svg = "".join(parts)
+    if request.args.get("dl"):
+        return Response(svg, mimetype="image/svg+xml",
+                        headers={"Content-Disposition":
+                                 f"attachment; filename=run{run_id}_compare.svg"})
+    return Response(svg, mimetype="image/svg+xml")
+
+
+@app.get("/export/run/<int:run_id>/record")
+def export_run_record(run_id):
+    """连排记录（HTML，可打印）：逐动作计划—实测对照，附异常与补正理由。"""
+    d = _run_detail(run_id)
+    if not d:
+        return "连排不存在", 404
+    plan, ana, run = d["plan"], d["analysis"], d["run"]
+    tasks = {t["id"]: t for t in plan["tasks"]}
+    actors = {a["id"]: a for a in plan["actors"]}
+    actuals = ana["actuals"]
+    by_id = {e["id"]: e for e in d["events"]}
+
+    def corr_note(e):
+        """补正说明：原时刻 → 新时刻 + 理由。"""
+        if not e["supersedes"] or e["supersedes"] not in by_id:
+            return ""
+        old = by_id[e["supersedes"]]
+        return f"（补正 {scheduler.fmt(old['at_sec'])}→{scheduler.fmt(e['at_sec'])}：{e['reason']}）"
+
+    KIND_CN = {"start": "开始", "done": "完成", "skip": "跳过", "exception": "异常"}
+    rows = []
+    for a in sorted(plan["actions"], key=lambda x: (x["task_id"], x["idx"])):
+        tid = a["task_id"]
+        ac = actuals.get(f"{tid}:{a['idx']}", {})
+        evs = [e for e in d["events"]
+               if e["task_id"] == tid and e["action_idx"] == a["idx"]]
+        notes = []
+        for e in evs:
+            if e["kind"] == "exception":
+                notes.append(f"异常@{scheduler.fmt(e['at_sec'])}：{e['reason']}")
+            elif e["reason"]:
+                notes.append(f"{KIND_CN[e['kind']]}{corr_note(e) or '：' + e['reason']}")
+        dev = ""
+        if ac.get("start") is not None:
+            dd = ac["start"] - a["start"]
+            dev = f"{dd:+d}s" if dd else "0"
+        rows.append(
+            f"<tr><td>#{tid}</td><td>{actors[tasks[tid]['actor_id']]['name']}</td>"
+            f"<td>{a['idx']} {a['label']}</td>"
+            f"<td>{scheduler.fmt(a['start'])}（{a['dur']}s）</td>"
+            f"<td>{scheduler.fmt(ac['start']) if ac.get('start') is not None else ('跳过' if ac.get('skipped') else '—')}</td>"
+            f"<td>{scheduler.fmt(ac['end']) if ac.get('end') is not None else '—'}</td>"
+            f"<td>{dev}</td><td class=note>{'；'.join(notes)}</td></tr>")
+    ana_rows = "".join(
+        f"<li>[{scheduler.fmt(c['time'])}] 任务#{c['task_id']} {c['message']}</li>"
+        for c in ana["anomalies"]) or "<li>无</li>"
+    fd = ana["first_deviation"]
+    fd_html = (f"<p>首个偏差：任务#{fd['task_id']} 动作{fd['action_idx']}「{fd['label']}」"
+               f"@ {scheduler.fmt(fd['time'])} — {fd['message']}</p>") if fd else "<p>无显著偏差</p>"
+    chain_html = "".join(f"<li>[{scheduler.fmt(c['time'])}] {c['message']}</li>"
+                         for c in ana["chain"])
+    import time as _time
+    html = f"""<!doctype html><html lang=zh><meta charset=utf-8>
+<title>连排记录 · {run['name']}</title>
+<style>body{{font-family:sans-serif;margin:24px}}table{{border-collapse:collapse;width:100%}}
+td,th{{border:1px solid #999;padding:5px 7px;font-size:12px;vertical-align:top}}
+h1{{font-size:19px}}h2{{font-size:15px;margin-top:18px}}.note{{color:#a04000}}</style>
+<h1>连排记录 · {run['name']}</h1>
+<p>基准修订 #{run['revision_id']}｜开启 {_time.strftime('%Y-%m-%d %H:%M', _time.localtime(run['created_at']))}
+｜状态 {'已结束' if run['status']=='done' else '进行中'}</p>
+<h2>动作实测对照</h2>
+<table><tr><th>任务</th><th>演员</th><th>动作</th><th>计划开始(时长)</th><th>实测开始</th>
+<th>实测完成</th><th>偏差</th><th>异常/补正理由</th></tr>{''.join(rows)}</table>
+<h2>实测检查</h2><ul>{ana_rows}</ul>
+<h2>首个偏差与等待链</h2>{fd_html}<ul>{chain_html}</ul>"""
+    return html
 
 
 def create_app():
