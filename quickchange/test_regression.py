@@ -213,6 +213,89 @@ def test_single_copy_busy_until_scene_end_without_doff():
         f"无脱下记录时副本应占用到场次结束 {scene3_end}，乙实际 {don_b['start']}"
 
 
+# ---------- 用例 4：脱下被顺延 → 副本占用延长到实际脱下结束 ----------
+
+def _state_delayed_doff():
+    """甲 101 穿上唯一斗篷；甲的脱下任务因服装师被丙占用而顺延，
+    实际脱下结束 = 521（估算值仅 399）。乙在 399–411 不得拿到同一副本。"""
+    return {
+        "scenes": [
+            {"id": 1, "production_id": 1, "seq": 1, "name": "S1", "start_sec": 0, "duration_sec": 100},
+            {"id": 2, "production_id": 1, "seq": 2, "name": "S2", "start_sec": 150, "duration_sec": 100},
+            {"id": 3, "production_id": 1, "seq": 3, "name": "S3", "start_sec": 300, "duration_sec": 90},
+            {"id": 4, "production_id": 1, "seq": 4, "name": "S4", "start_sec": 600, "duration_sec": 100},
+            {"id": 5, "production_id": 1, "seq": 5, "name": "S5", "start_sec": 335, "duration_sec": 50},
+            {"id": 6, "production_id": 1, "seq": 6, "name": "S6", "start_sec": 700, "duration_sec": 100},
+        ],
+        "actors": [
+            {"id": 1, "production_id": 1, "name": "甲", "code": "", "default_side": "L"},
+            {"id": 2, "production_id": 1, "name": "乙", "code": "", "default_side": "L"},
+            {"id": 3, "production_id": 1, "name": "丙", "code": "", "default_side": "L"},
+        ],
+        "items": [
+            {"id": 1, "production_id": 1, "name": "斗篷", "kind": "costume", "layer": 2,
+             "don_sec": 12, "doff_sec": 8, "status": "ok", "available_at": 0,
+             "cart_id": None, "copies": 1},
+            {"id": 2, "production_id": 1, "name": "帽子", "kind": "costume", "layer": 1,
+             "don_sec": 125, "doff_sec": 5, "status": "ok", "available_at": 0,
+             "cart_id": None, "copies": 1},
+        ],
+        "looks": [
+            {"id": 1, "production_id": 1, "actor_id": 1, "scene_id": 1, "name": ""},
+            {"id": 2, "production_id": 1, "actor_id": 1, "scene_id": 2, "name": ""},
+            {"id": 3, "production_id": 1, "actor_id": 1, "scene_id": 3, "name": ""},
+            {"id": 4, "production_id": 1, "actor_id": 1, "scene_id": 4, "name": ""},
+            {"id": 5, "production_id": 1, "actor_id": 2, "scene_id": 2, "name": ""},
+            {"id": 6, "production_id": 1, "actor_id": 2, "scene_id": 3, "name": ""},
+            {"id": 7, "production_id": 1, "actor_id": 3, "scene_id": 5, "name": ""},
+            {"id": 8, "production_id": 1, "actor_id": 3, "scene_id": 6, "name": ""},
+        ],
+        "look_items": [
+            {"look_id": 2, "item_id": 1, "ord": 0},   # 甲 S2、S3 穿斗篷
+            {"look_id": 3, "item_id": 1, "ord": 0},
+            {"look_id": 6, "item_id": 1, "ord": 0},   # 乙 S3 要斗篷
+            {"look_id": 8, "item_id": 2, "ord": 0},   # 丙 S6 戴帽子（长时间占用服装师）
+        ],
+        "dressers": [{"id": 1, "production_id": 1, "name": "王姐"}],
+        "positions": [],
+        "carts": [],
+        "tasks": [
+            {"id": 1, "production_id": 1, "actor_id": 1, "from_scene_id": 1, "to_scene_id": 2,
+             "exit_side": "L", "position_id": None, "dresser_id": None, "start_sec": None,
+             "locked": 0, "needs_review": 0, "note": ""},
+            {"id": 2, "production_id": 1, "actor_id": 1, "from_scene_id": 3, "to_scene_id": 4,
+             "exit_side": "L", "position_id": None, "dresser_id": 1, "start_sec": None,
+             "locked": 0, "needs_review": 0, "note": ""},
+            {"id": 3, "production_id": 1, "actor_id": 2, "from_scene_id": 2, "to_scene_id": 3,
+             "exit_side": "L", "position_id": None, "dresser_id": None, "start_sec": None,
+             "locked": 0, "needs_review": 0, "note": ""},
+            # 丙的任务 385 就绪，穿帽子 125s，把服装师占用到 512
+            {"id": 9, "production_id": 1, "actor_id": 3, "from_scene_id": 5, "to_scene_id": 6,
+             "exit_side": "L", "position_id": None, "dresser_id": 1, "start_sec": None,
+             "locked": 0, "needs_review": 0, "note": ""},
+        ],
+    }
+
+
+def test_delayed_doff_extends_occupancy():
+    sched = scheduler.compute_schedule(_state_delayed_doff())
+    don_a = next(a for a in sched["actions"] if a["task_id"] == 1 and a["kind"] == "don")
+    doff_a = next(a for a in sched["actions"] if a["task_id"] == 2 and a["kind"] == "doff")
+    don_b = next(a for a in sched["actions"] if a["task_id"] == 3 and a["kind"] == "don")
+    assert don_a["start"] == 101, f"甲穿上时刻应为 101，实得 {don_a['start']}"
+    assert doff_a["end"] == 521, \
+        f"服装师争用应使脱下顺延到 521 结束，实得 {doff_a['end']}"
+    # 甲实际穿着区间 [101, 521)；乙不得在估算释放点 399–411 拿到同一副本
+    assert don_b["start"] >= doff_a["end"], \
+        f"副本在实际脱下前被重复分配：甲穿到 {doff_a['end']}，乙 {don_b['start']}"
+    assert not (399 <= don_b["start"] < 411), \
+        f"乙在估算释放窗口 [399,411) 内拿到了副本：{don_b['start']}"
+    # 实际占用区间无交集
+    assert (don_b["start"], 10**9) and don_b["start"] >= doff_a["end"]
+    assert any(c["task_id"] == 3 and c["type"] == "item" for c in sched["conflicts"]), \
+        "应报告乙的缺件/复用冲突"
+
+
 if __name__ == "__main__":
     print("回归测试：")
     check("锁定任务的普通更新被拒绝（start_sec/position_id）", test_locked_update_rejected)
@@ -220,4 +303,5 @@ if __name__ == "__main__":
     check("单件服装穿着期间不重复分配（有脱下记录）", test_single_copy_busy_until_doff)
     check("单件服装穿着期间不重复分配（无脱下记录→场次结束）",
           test_single_copy_busy_until_scene_end_without_doff)
+    check("脱下被顺延 → 副本占用延长到实际脱下结束", test_delayed_doff_extends_occupancy)
     print(f"全部通过（{len(PASS)} 项）")

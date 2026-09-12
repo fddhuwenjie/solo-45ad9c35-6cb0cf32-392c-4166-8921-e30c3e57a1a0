@@ -146,13 +146,16 @@ def _wear_segments(state, tasks):
     return segs
 
 
-def _seg_release(seg, tasks_by_id, scenes, items):
-    """段落释放时刻的估计：有脱下任务 → 该任务中脱下动作的预计结束时刻；
-    否则 → 穿着末场的结束时刻。"""
+def _seg_release(seg, tasks_by_id, scenes, items, doff_actuals=None):
+    """段落释放时刻：有脱下任务 → 该任务中脱下动作的结束时刻
+    （优先取上一轮排程的实际值 doff_actuals；首轮按期望开始时刻估算）；
+    没有脱下记录 → 演员穿着该件的末场结束时刻。"""
     it = items.get(seg["item_id"])
     extra = CLEAN_SEC if it and it["status"] == "cleaning" else 0
     dt = tasks_by_id.get(seg.get("doff_task"))
     if dt is not None:
+        if doff_actuals and (dt["id"], seg["item_id"]) in doff_actuals:
+            return doff_actuals[(dt["id"], seg["item_id"])] + extra
         cur = dt["_desired"]
         for a in dt["_acts"]:
             cur += a["dur"]
@@ -215,6 +218,11 @@ def compute_schedule(state, overrides=None):
     overrides: {task_id: {"start_sec":..,"position_id":..,"dresser_id":..}} 临时改动，
     用于“替代排法”试算，不写库。
     返回 {actions, windows, conflicts}
+
+    定点迭代：首轮按期望开始时刻估算副本释放点；随后每轮用上一轮的
+    实际脱下结束时刻作为精确释放点重排，直到释放点收敛。资源冲突
+    （如服装师争用）使脱下顺延的，副本占用随之延长到实际脱下结束，
+    最终排程不会保留因估算提前释放造成的重复分配。
     """
     overrides = overrides or {}
     scenes = _index(state["scenes"])
@@ -241,6 +249,25 @@ def compute_schedule(state, overrides=None):
     # 锁定任务只保留自己的固定时段，不会预先挤占更早任务的服装师/换装位。
     tasks.sort(key=lambda t: (t["_desired"], 0 if t["locked"] else 1, t["id"]))
     tasks_by_id = {t["id"]: t for t in tasks}
+    segs = _wear_segments(state, tasks)
+
+    doff_actuals = None
+    result = None
+    for _ in range(6):
+        result = _schedule_once(state, tasks, tasks_by_id, scenes, items,
+                                positions, segs, doff_actuals)
+        new_actuals = {(a["task_id"], a["item_id"]): a["end"]
+                       for a in result["actions"]
+                       if a["kind"] == "doff" and a.get("item_id") is not None}
+        if doff_actuals is not None and new_actuals == doff_actuals:
+            break  # 释放点已收敛：本轮使用的即为实际脱下结束时刻
+        doff_actuals = new_actuals
+    return result
+
+
+def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
+                   doff_actuals):
+    """单轮排程。doff_actuals: {(task_id,item_id): 实际脱下结束时刻}（上一轮结果）。"""
 
     actor_busy = defaultdict(list)     # actor_id -> [(s,e,task_id)]
     dresser_busy = defaultdict(list)   # dresser_id -> [(s,e,task_id)]
@@ -254,12 +281,12 @@ def compute_schedule(state, overrides=None):
             for cp in cps:
                 cp.append([0, it["available_at"], "status"])
         copies[it["id"]] = cps
-    segs = _wear_segments(state, tasks)
+    segs = segs if segs is not None else _wear_segments(state, tasks)
     worn = {}                          # (actor,item) -> (副本下标, 区间)
     for (aid, iid), lst in segs.items():
         for seg in lst:
             if seg["don_task"] is None:    # 无穿上任务：从穿着首场的开场起占用
-                rel = _seg_release(seg, tasks_by_id, scenes, items)
+                rel = _seg_release(seg, tasks_by_id, scenes, items, doff_actuals)
                 sc = scenes.get(seg["start_scene"])
                 start0 = sc["start_sec"] if sc else 0
                 pick = _pick_copy(copies[iid], start0, rel)
@@ -356,7 +383,7 @@ def compute_schedule(state, overrides=None):
             if a["kind"] == "don":
                 seg = next((g for g in segs.get((aid, iid), [])
                             if g["start_scene"] == t["to_scene_id"]), None)
-                rel = _seg_release(seg, tasks_by_id, scenes, items) if seg \
+                rel = _seg_release(seg, tasks_by_id, scenes, items, doff_actuals) if seg \
                     else _scene_end(state, t["to_scene_id"])
                 rel = max(rel, a["end"])  # 至少占用到穿上动作结束
                 pick = _pick_copy(copies[iid], a["start"], rel)
