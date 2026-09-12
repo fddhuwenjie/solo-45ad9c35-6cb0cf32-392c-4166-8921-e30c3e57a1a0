@@ -165,19 +165,40 @@ def _seg_release(seg, tasks_by_id, scenes, items, doff_actuals=None):
     return (sc["start_sec"] + sc["duration_sec"]) if sc else 0
 
 
-def _copy_wait(cps, t):
-    """在 t 时刻所有副本都被占用时，需要等待的秒数；有空闲副本返回 0。"""
-    wait = None
+def _copy_gap_abs(cps, t, end):
+    """最早 t'≥t 使某副本在 [t', end) 全程空闲；无可行副本返回 None。"""
+    best = None
     for cp in cps:
-        w = 0
-        for iv in cp:
-            if iv[0] <= t < iv[1]:
-                w = iv[1] - t
+        cur = t
+        ok = True
+        for iv in sorted(cp):
+            if iv[1] <= cur:
+                continue
+            if iv[0] >= end:
                 break
-        if w == 0:
-            return 0
-        wait = w if wait is None else min(wait, w)
-    return wait or 0
+            cur = iv[1]          # 与 [cur,end) 相交 → 推到该区间结束之后
+            if cur >= end:
+                ok = False
+                break
+        if ok and (best is None or cur < best):
+            best = cur
+    return best
+
+
+def _copy_gap_dur(cps, t, dur):
+    """最早 t'≥t 使某副本在 [t', t'+dur) 空闲（仅保证穿上动作本身不重叠）。"""
+    best = None
+    for cp in cps:
+        cur = t
+        for iv in sorted(cp):
+            if iv[1] <= cur:
+                continue
+            if iv[0] >= cur + dur:
+                break
+            cur = iv[1]
+        if best is None or cur < best:
+            best = cur
+    return best if best is not None else t
 
 
 def _pick_copy(cps, t, release):
@@ -253,16 +274,59 @@ def compute_schedule(state, overrides=None):
 
     doff_actuals = None
     result = None
-    for _ in range(6):
+    for _ in range(12):
         result = _schedule_once(state, tasks, tasks_by_id, scenes, items,
                                 positions, segs, doff_actuals)
         new_actuals = {(a["task_id"], a["item_id"]): a["end"]
                        for a in result["actions"]
                        if a["kind"] == "doff" and a.get("item_id") is not None}
-        if doff_actuals is not None and new_actuals == doff_actuals:
-            break  # 释放点已收敛：本轮使用的即为实际脱下结束时刻
+        converged = doff_actuals is not None and new_actuals == doff_actuals
+        if converged and not _find_copy_overlaps(result["copies"]):
+            break  # 释放点收敛且无交叠：本轮使用的即为实际脱下结束时刻
+        if converged:
+            break  # 收敛但仍有交叠：由返回前的修复兜底
         doff_actuals = new_actuals
+    # 返回前保证：同一副本的实际占用区间不得交叠
+    _repair_copy_overlaps(result, items)
+    result["conflicts"].sort(key=lambda c: (c["time"], c["task_id"]))
     return result
+
+
+def _find_copy_overlaps(copies):
+    """列出所有同一副本上交叠的占用区间对。"""
+    bad = []
+    for iid, cps in copies.items():
+        for ci, cp in enumerate(cps):
+            ivs = sorted(cp, key=lambda x: (x[0], x[1]))
+            for a, b in zip(ivs, ivs[1:]):
+                if b[0] < a[1]:
+                    bad.append((iid, ci, a, b))
+    return bad
+
+
+def _repair_copy_overlaps(result, items):
+    """兜底：移除同一副本上较晚的交叠分配并记录冲突，保证返回结果无重复分配。"""
+    for iid, cps in result["copies"].items():
+        it = items.get(iid)
+        name = it["name"] if it else f"#{iid}"
+        for cp in cps:
+            kept = []
+            for iv in sorted(cp, key=lambda x: (x[0], x[1])):
+                if kept and iv[0] < kept[-1][1]:
+                    tid = _iv_task_id(iv)
+                    result["conflicts"].append({
+                        "type": "item", "task_id": tid, "time": iv[0],
+                        "message": f"缺件：{name} 副本占用交叠，已取消较晚的重复分配"})
+                    continue
+                kept.append(iv)
+            cp[:] = kept
+
+
+def _iv_task_id(iv):
+    try:
+        return int(str(iv[2]).split(":")[1]) if str(iv[2]).startswith("task:") else 0
+    except (IndexError, ValueError):
+        return 0
 
 
 def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
@@ -282,6 +346,18 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
                 cp.append([0, it["available_at"], "status"])
         copies[it["id"]] = cps
     segs = segs if segs is not None else _wear_segments(state, tasks)
+    actions, windows, conflicts = [], {}, []
+
+    # 每个穿上动作在本轮的释放点（随定点迭代更新为实际值）
+    for t in tasks:
+        for a in t["_acts"]:
+            if a["kind"] == "don" and a.get("item_id") is not None:
+                seg = next((g for g in segs.get((t["actor_id"], a["item_id"]), [])
+                            if g["start_scene"] == t["to_scene_id"]), None)
+                a["_release"] = _seg_release(seg, tasks_by_id, scenes, items,
+                                             doff_actuals) if seg \
+                    else _scene_end(state, t["to_scene_id"])
+
     worn = {}                          # (actor,item) -> (副本下标, 区间)
     for (aid, iid), lst in segs.items():
         for seg in lst:
@@ -290,12 +366,16 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
                 sc = scenes.get(seg["start_scene"])
                 start0 = sc["start_sec"] if sc else 0
                 pick = _pick_copy(copies[iid], start0, rel)
-                idx = pick[0] if pick else 0
+                if pick is None or not pick[1]:
+                    it = items.get(iid)
+                    conflicts.append({
+                        "type": "item", "task_id": 0, "time": start0,
+                        "message": f"缺件：{it['name'] if it else iid} 开场穿着无可用副本（副本不足）"})
+                    continue
+                idx = pick[0]
                 iv = [start0, rel, f"init:a{aid}"]
                 copies[iid][idx].append(iv)
                 worn[(aid, iid)] = (idx, iv)
-
-    actions, windows, conflicts = [], {}, []
 
     for t in tasks:
         tid = t["id"]
@@ -306,7 +386,7 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
         item_wait_notes = []
         laid = None
         for _ in range(80):
-            # 1) 顺序布局动作；穿上动作若遇副本未释放则等待
+            # 1) 顺序布局动作；穿上动作须在 [开始, 释放点) 全程有可用副本
             item_wait_notes = []
             cur = s
             laid = []
@@ -314,16 +394,26 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
                 a = dict(a)
                 a["start"] = cur
                 if a["kind"] == "don" and a.get("item_id") is not None:
-                    w = _copy_wait(copies[a["item_id"]], cur)
-                    if w > 0:
-                        it = items.get(a["item_id"])
+                    iid = a["item_id"]
+                    it = items.get(iid)
+                    rel = max(a.get("_release", 0), cur + a["dur"])
+                    t1 = _copy_gap_abs(copies[iid], cur, rel)
+                    if t1 is None:
+                        # 穿着全程无可行副本：退化为仅保证穿上动作本身不重叠，
+                        # 提交阶段若仍无法全程分配则拒绝（不产生重复分配）
+                        t2 = _copy_gap_dur(copies[iid], cur, a["dur"])
+                        item_wait_notes.append({
+                            "type": "item", "task_id": tid, "time": t2,
+                            "message": f"缺件：{a['label']} 穿着期间无连续可用副本"})
+                        a["start"] = t2
+                    elif t1 > cur:
                         why = "清洁/维修中" if it and it["status"] != "ok" \
                             else "复用等待（前一位演员尚未脱下）"
                         item_wait_notes.append({
-                            "type": "item", "task_id": tid, "time": cur + w,
+                            "type": "item", "task_id": tid, "time": t1,
                             "message": f"缺件/复用冲突：{a['label']} 需等到 "
-                                       f"{fmt(cur + w)}（{why}）"})
-                        a["start"] = cur + w
+                                       f"{fmt(t1)}（{why}）"})
+                        a["start"] = t1
                 a["end"] = a["start"] + a["dur"]
                 cur = a["end"]
                 laid.append(a)
@@ -381,22 +471,15 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
             if iid is None:
                 continue
             if a["kind"] == "don":
-                seg = next((g for g in segs.get((aid, iid), [])
-                            if g["start_scene"] == t["to_scene_id"]), None)
-                rel = _seg_release(seg, tasks_by_id, scenes, items, doff_actuals) if seg \
-                    else _scene_end(state, t["to_scene_id"])
-                rel = max(rel, a["end"])  # 至少占用到穿上动作结束
+                rel = max(a.get("_release", a["end"]), a["end"])
                 pick = _pick_copy(copies[iid], a["start"], rel)
-                if pick is None:
+                if pick is None or not pick[1]:
+                    # 无连续可用副本：拒绝分配，绝不放置交叠区间
                     item_commit_notes.append({
                         "type": "item", "task_id": tid, "time": a["start"],
-                        "message": f"缺件：{a['label']} 无可用副本"})
+                        "message": f"缺件：{a['label']} 穿着期间无连续可用副本，未分配"})
                     continue
-                idx, fits = pick
-                if not fits:
-                    item_commit_notes.append({
-                        "type": "item", "task_id": tid, "time": a["start"],
-                        "message": f"复用冲突：{a['label']} 穿着期间与后续占用重叠（副本不足）"})
+                idx = pick[0]
                 iv = [a["start"], rel, f"task:{tid}"]
                 copies[iid][idx].append(iv)
                 worn[(aid, iid)] = (idx, iv)
@@ -407,8 +490,7 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
                 if key in worn:
                     _, iv = worn.pop(key)
                     iv[1] = a["end"] + extra   # 副本实际释放时刻 = 脱下动作结束(+清洁)
-                else:
-                    copies[iid][0].append([0, a["end"] + extra, f"orphan:{tid}"])
+                # 无对应穿着记录（数据缺造型或该次穿上未分配）：不产生区间
 
         # 3) 截止检查：第一个超出截止时间的动作
         fail = next((a for a in laid if a["end"] > win["deadline"]), None)
@@ -431,7 +513,8 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
 
     actions.sort(key=lambda a: (a["start"], a["task_id"]))
     conflicts.sort(key=lambda c: (c["time"], c["task_id"]))
-    return {"actions": actions, "windows": windows, "conflicts": conflicts}
+    return {"actions": actions, "windows": windows, "conflicts": conflicts,
+            "copies": copies}
 
 
 def suggest(state, max_options=3):

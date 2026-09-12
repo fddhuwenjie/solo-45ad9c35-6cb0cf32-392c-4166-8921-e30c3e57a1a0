@@ -296,6 +296,88 @@ def test_delayed_doff_extends_occupancy():
         "应报告乙的缺件/复用冲突"
 
 
+# ---------- 用例 5：七场单副本反例 —— 窗口内后续占用不得被无视 ----------
+
+def _state_seven_scene_single_copy():
+    """I2 单副本。甲的任务先排（就绪 20），其 I2 穿上落在 [286,291)；
+    乙 26 即可穿上、释放点 322 —— 旧逻辑在 26 发现副本空闲便分配 [26,322)，
+    无视窗口内甲的 [286,291)，造成同一副本重复占用。"""
+    return {
+        "scenes": [
+            {"id": 1, "production_id": 1, "seq": 1, "name": "S1", "start_sec": 0, "duration_sec": 20},
+            {"id": 2, "production_id": 1, "seq": 2, "name": "S2", "start_sec": 0, "duration_sec": 25},
+            {"id": 3, "production_id": 1, "seq": 3, "name": "S3", "start_sec": 30, "duration_sec": 241},
+            {"id": 4, "production_id": 1, "seq": 4, "name": "S4", "start_sec": 287, "duration_sec": 4},
+            {"id": 5, "production_id": 1, "seq": 5, "name": "S5", "start_sec": 30, "duration_sec": 100},
+            {"id": 6, "production_id": 1, "seq": 6, "name": "S6", "start_sec": 150, "duration_sec": 172},
+            {"id": 7, "production_id": 1, "seq": 7, "name": "S7", "start_sec": 400, "duration_sec": 100},
+        ],
+        "actors": [
+            {"id": 1, "production_id": 1, "name": "甲", "code": "", "default_side": "L"},
+            {"id": 2, "production_id": 1, "name": "乙", "code": "", "default_side": "L"},
+            {"id": 3, "production_id": 1, "name": "丙", "code": "", "default_side": "L"},
+        ],
+        "items": [
+            {"id": 1, "production_id": 1, "name": "I1", "kind": "costume", "layer": 1,
+             "don_sec": 15, "doff_sec": 5, "status": "ok", "available_at": 0,
+             "cart_id": None, "copies": 1},
+            {"id": 2, "production_id": 1, "name": "I2", "kind": "costume", "layer": 2,
+             "don_sec": 5, "doff_sec": 5, "status": "ok", "available_at": 0,
+             "cart_id": None, "copies": 1},
+        ],
+        "looks": [
+            {"id": 1, "production_id": 1, "actor_id": 1, "scene_id": 1, "name": ""},
+            {"id": 2, "production_id": 1, "actor_id": 1, "scene_id": 4, "name": ""},
+            {"id": 3, "production_id": 1, "actor_id": 2, "scene_id": 2, "name": ""},
+            {"id": 4, "production_id": 1, "actor_id": 2, "scene_id": 5, "name": ""},
+            {"id": 5, "production_id": 1, "actor_id": 2, "scene_id": 6, "name": ""},
+            {"id": 6, "production_id": 1, "actor_id": 3, "scene_id": 3, "name": ""},
+        ],
+        "look_items": [
+            {"look_id": 2, "item_id": 1, "ord": 0},   # 甲 S4 穿 I1、I2
+            {"look_id": 2, "item_id": 2, "ord": 1},
+            {"look_id": 4, "item_id": 2, "ord": 0},   # 乙 S5、S6 穿 I2
+            {"look_id": 5, "item_id": 2, "ord": 0},
+            {"look_id": 6, "item_id": 1, "ord": 0},   # 丙 S3 穿 I1（占用到 271）
+        ],
+        "dressers": [],
+        "positions": [],
+        "carts": [],
+        "tasks": [
+            # 甲：20 就绪；先等 I1 到 271，再穿 I2 → I2 穿上落在 [286,291)
+            {"id": 1, "production_id": 1, "actor_id": 1, "from_scene_id": 1, "to_scene_id": 4,
+             "exit_side": "L", "position_id": None, "dresser_id": None, "start_sec": None,
+             "locked": 0, "needs_review": 0, "note": ""},
+            # 乙：25 就绪，26 即可穿 I2，释放点 322（S6 结束）
+            {"id": 2, "production_id": 1, "actor_id": 2, "from_scene_id": 2, "to_scene_id": 5,
+             "exit_side": "L", "position_id": None, "dresser_id": None, "start_sec": None,
+             "locked": 0, "needs_review": 0, "note": ""},
+        ],
+    }
+
+
+def test_seven_scene_single_copy_no_overlap():
+    st = _state_seven_scene_single_copy()
+    sched = scheduler.compute_schedule(st)
+    don_a = next(a for a in sched["actions"]
+                 if a["task_id"] == 1 and a["kind"] == "don" and a["item_id"] == 2)
+    don_b = next(a for a in sched["actions"]
+                 if a["task_id"] == 2 and a["kind"] == "don" and a["item_id"] == 2)
+    assert (don_a["start"], don_a["end"]) == (286, 291), \
+        f"甲的 I2 穿上应为 [286,291)，实得 [{don_a['start']},{don_a['end']})"
+    assert don_b["start"] >= don_a["end"], \
+        f"I2 重复分配：乙 {don_b['start']} 拿到副本时甲占用至 {don_a['end']}"
+    # 同一副本的实际占用区间必须无交叠
+    assert scheduler._find_copy_overlaps(sched["copies"]) == [], \
+        f"最终排程仍存在副本交叠：{scheduler._find_copy_overlaps(sched['copies'])}"
+    ivs = sorted(iv for cp in sched["copies"][2] for iv in cp)
+    for x, y in zip(ivs, ivs[1:]):
+        assert y[0] >= x[1], f"I2 占用区间交叠：{x} 与 {y}"
+    # 无法执行的情形必须报告，而不是静默重复分配
+    assert any(c["task_id"] == 2 and c["type"] in ("item", "late")
+               for c in sched["conflicts"]), "乙的缺件/超时应被报告"
+
+
 if __name__ == "__main__":
     print("回归测试：")
     check("锁定任务的普通更新被拒绝（start_sec/position_id）", test_locked_update_rejected)
@@ -304,4 +386,5 @@ if __name__ == "__main__":
     check("单件服装穿着期间不重复分配（无脱下记录→场次结束）",
           test_single_copy_busy_until_scene_end_without_doff)
     check("脱下被顺延 → 副本占用延长到实际脱下结束", test_delayed_doff_extends_occupancy)
+    check("七场单副本反例：I2 不重复分配、最终无交叠", test_seven_scene_single_copy_no_overlap)
     print(f"全部通过（{len(PASS)} 项）")
