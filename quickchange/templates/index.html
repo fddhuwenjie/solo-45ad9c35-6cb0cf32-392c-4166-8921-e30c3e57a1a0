@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>舞台快速换装编排</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>舞台快速换装编排</h1>
+  <div class="toolbar">
+    <button id="btn-reschedule">重排（不动已锁）</button>
+    <button id="btn-save-rev">保存修订</button>
+    <span class="sep"></span>
+    <span class="lbl">导出：</span>
+    <select id="export-actor"></select>
+    <button id="btn-cue">个人提示单</button>
+    <button id="btn-flow">服装流转表</button>
+    <button id="btn-svg">SVG时间线</button>
+  </div>
+</header>
+
+<main>
+  <section id="panel-timeline">
+    <h2>场次时间轴 <span class="hint">拖动任务块调整开始时间；点击选中</span></h2>
+    <svg id="timeline" width="1180" height="260"></svg>
+    <div id="conflicts"></div>
+    <div id="suggestions"></div>
+  </section>
+
+  <div class="row">
+    <section id="panel-plan">
+      <h2>侧台平面图 <span class="hint">选中任务后显示走位路线</span></h2>
+      <svg id="plan" width="560" height="320"></svg>
+    </section>
+    <section id="panel-layers">
+      <h2>服装层级卡 <span class="hint">选中任务的脱/穿顺序</span></h2>
+      <div id="layer-cards"></div>
+    </section>
+    <section id="panel-detail">
+      <h2>任务详情</h2>
+      <div id="task-detail"><p class="muted">在时间轴上选择一个任务</p></div>
+    </section>
+  </div>
+
+  <section id="panel-entry">
+    <h2>数据录入</h2>
+    <div id="entry-forms"></div>
+    <h3>修订记录</h3>
+    <ul id="revisions"></ul>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
