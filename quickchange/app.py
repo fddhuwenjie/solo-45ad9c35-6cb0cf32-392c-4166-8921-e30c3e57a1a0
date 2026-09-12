@@ -72,17 +72,26 @@ def api_reschedule():
 @app.post("/api/tasks/<int:tid>")
 def api_task_update(tid):
     data = request.get_json(force=True)
-    sets, args = [], []
-    for k in ("start_sec", "position_id", "dresser_id", "locked", "note",
-              "exit_side", "from_scene_id", "to_scene_id"):
-        if k in data:
-            sets.append(f"{k}=?")
-            args.append(data[k])
-    if not sets:
-        return jsonify({"ok": False}), 400
-    args.append(tid)
     con = db.connect()
     try:
+        cur = con.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+        if not cur:
+            return jsonify({"ok": False, "error": "任务不存在"}), 404
+        # 已锁节点不得移动：普通更新不得改动 start_sec / position_id（解锁同请求除外）
+        if cur["locked"] and data.get("locked") != 0:
+            for k in ("start_sec", "position_id"):
+                if k in data and data[k] != cur[k]:
+                    return jsonify({"ok": False,
+                                    "error": "已锁节点不得移动：请先解锁再调整"}), 409
+        sets, args = [], []
+        for k in ("start_sec", "position_id", "dresser_id", "locked", "note",
+                  "exit_side", "from_scene_id", "to_scene_id"):
+            if k in data:
+                sets.append(f"{k}=?")
+                args.append(data[k])
+        if not sets:
+            return jsonify({"ok": False}), 400
+        args.append(tid)
         con.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=?", args)
         con.commit()
     finally:

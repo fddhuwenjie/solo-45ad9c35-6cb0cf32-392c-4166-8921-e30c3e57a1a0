@@ -117,7 +117,9 @@ document.addEventListener("pointerup", async (ev) => {
   const d = drag; drag = null;
   if (!d.moved) return;
   const w = S.schedule.windows[d.id];
-  await refresh(await api(`/api/tasks/${d.id}`, "POST", { start_sec: Math.round(w.start) }));
+  const res = await api(`/api/tasks/${d.id}`, "POST", { start_sec: Math.round(w.start) });
+  if (res && res.ok === false) { alert(res.error || "更新被拒绝"); return refresh(); }
+  await refresh(res);
 });
 
 /* ---------------- 侧台平面图 ---------------- */
@@ -253,10 +255,12 @@ function renderDetail() {
       .map((a) => `${fmt(a.start)} ${a.label}(${a.dur}s)`).join("<br>")}</div>`;
   $("#d-apply").onclick = async () => {
     const v = (id) => { const x = $(id).value; return x === "" ? null : (isNaN(+x) ? x : +x); };
-    await refresh(await api(`/api/tasks/${t.id}`, "POST", {
+    const res = await api(`/api/tasks/${t.id}`, "POST", {
       dresser_id: v("#d-dresser"), position_id: v("#d-position"),
       exit_side: $("#d-side").value, start_sec: v("#d-start"),
-    }));
+    });
+    if (res && res.ok === false) { alert(res.error || "更新被拒绝"); return refresh(); }
+    await refresh(res);
   };
   $("#d-lock").onclick = async () =>
     refresh(await api(`/api/tasks/${t.id}`, "POST", { locked: t.locked ? 0 : 1 }));
