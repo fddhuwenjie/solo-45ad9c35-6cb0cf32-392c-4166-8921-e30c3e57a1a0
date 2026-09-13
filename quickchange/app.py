@@ -296,13 +296,30 @@ def api_run_event(run_id):
         return jsonify({"ok": False, "error": "时刻超出合理范围"}), 400
     if kind == "exception" and not reason:
         return jsonify({"ok": False, "error": "异常打点必须填写理由"}), 400
+    # 现场实际使用的服装/副本（可空=按计划）；类型校验，错用在分析中识别
+    item_id, copy_id = data.get("item_id"), data.get("copy_id")
+    if item_id is not None:
+        try:
+            item_id = int(item_id)
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "item_id 必须是整数"}), 400
+        if item_id not in {i["id"] for i in plan["items"]}:
+            return jsonify({"ok": False, "error": "服装不在本次连排基准计划中"}), 404
+    if copy_id is not None:
+        try:
+            copy_id = int(copy_id)
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "copy_id 必须是整数"}), 400
+        if copy_id < 1:
+            return jsonify({"ok": False, "error": "copy_id 必须 ≥ 1"}), 400
     events = db.run_events(run_id)
     prev = rehearsal.effective_events(events).get((tid, idx, kind))
     if prev and not reason:
         return jsonify({"ok": False,
                         "error": "补正已有打点必须填写理由（原记录保留备查）"}), 400
     db.add_event(run_id, tid, idx, kind, at_sec, reason,
-                 supersedes=prev["id"] if prev else None)
+                 supersedes=prev["id"] if prev else None,
+                 item_id=item_id, copy_id=copy_id)
     return jsonify({"ok": True, "run": _run_detail(run_id)})
 
 
@@ -316,17 +333,24 @@ def api_run_close(run_id):
 
 @app.get("/api/runs/summary")
 def api_run_summary():
-    """汇总多次已结束连排，给出服装用时建议。"""
-    return jsonify({"suggestions": rehearsal.summarize_suggestions(db.load_state(PID), PID)})
+    """汇总已结束连排，给出服装用时建议；?revision_id= 限定同一基准修订。"""
+    rid = request.args.get("revision_id", type=int)
+    return jsonify({"suggestions":
+                    rehearsal.summarize_suggestions(db.load_state(PID), PID, rid)})
 
 
 @app.post("/api/runs/derive")
 def api_run_derive():
-    """勾选建议 → 从基准派生修订：只重排受影响任务，锁定节点不动。"""
+    """勾选建议 → 从所选连排的基准修订派生新修订：
+    只重排受影响任务，锁定节点不动，不触碰当前可变方案。"""
     data = request.get_json(force=True)
-    result = rehearsal.derive_revision(data.get("keys", []), PID)
+    try:
+        run_id = int(data.get("run_id"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "必须指定所选连排 run_id"}), 400
+    result = rehearsal.derive_revision(run_id, data.get("keys", []), PID)
     if not result:
-        return jsonify({"ok": False, "error": "没有可应用的建议"}), 400
+        return jsonify({"ok": False, "error": "连排/基准修订不存在，或没有可应用的建议"}), 400
     out = full_state()
     out["derived"] = result
     return jsonify(out)

@@ -261,18 +261,23 @@ def test_item_copy_misuse_detected():
     os.unlink(tmp)
 
 
-# ---------- 用例 6：汇总建议与派生修订（锁定节点不动） ----------
+# ---------- 用例 6：基准派生（绑定基准修订、锁定不动、不污染当前方案） ----------
 
-def test_summary_and_derive_respects_locks():
+def test_derive_binds_base_revision():
     tmp = _fresh_db()
     con = db.connect()
     _base_scene(con)
+    # 基准里任务#2 已锁定在 110
+    con.execute("UPDATE tasks SET start_sec=110, locked=1 WHERE id=2")
+    con.commit()
     con.close()
     client = _client()
 
-    # 两轮连排：帽子穿上实测 6/7s 与 5/6s（基准 4s）
-    for run_no, durs in ((1, (6, 7)), (2, (5, 6))):
+    # 两轮连排：帽子穿上实测 6/7s 与 5/6s（基准 4s），均为王姐配置
+    run_ids = []
+    for durs in ((6, 7), (5, 6)):
         run_id = _make_run(client)
+        run_ids.append(run_id)
         d1, d2 = durs
         _punch(client, run_id, 1, 2, "start", 100)
         _punch(client, run_id, 1, 2, "done", 100 + d1)   # 甲 穿·帽子
@@ -280,24 +285,146 @@ def test_summary_and_derive_respects_locks():
         _punch(client, run_id, 2, 1, "done", 200 + d2)   # 乙 穿·帽子
         client.post(f"/api/runs/{run_id}/close")
 
-    r = client.get("/api/runs/summary").get_json()
+    r = client.get("/api/runs/summary?revision_id=1").get_json()
     sugg = [s for s in r["suggestions"] if s["item_name"] == "帽子" and s["action"] == "don"]
     assert sugg, f"应给出帽子穿上时长建议：{r}"
     s = sugg[0]
-    assert s["current"] == 4 and s["suggested"] == 6 and s["n"] == 4, s
+    assert s["key"] == "2:don:1" and s["current"] == 4 and s["suggested"] == 6, s
 
-    # 锁定任务#2（固定 110 开始）后派生：建议生效、#2 不动、生成新修订
-    client.post("/api/tasks/2", json={"start_sec": 110, "locked": 1})
-    r = client.post("/api/runs/derive", json={"keys": [s["key"]]}).get_json()
+    # 派生前把当前可变方案改乱：不得被带入新修订
+    client.post("/api/tasks/1", json={"start_sec": 999})
+    client.post("/api/items/2", json={"don_sec": 1})
+
+    r = client.post("/api/runs/derive",
+                    json={"run_id": run_ids[0], "keys": [s["key"]]}).get_json()
     assert "derived" in r, r
+    new_rev = r["derived"]["revision_id"]
+
+    import json as _json
     con = db.connect()
-    hat = con.execute("SELECT don_sec FROM items WHERE id=2").fetchone()["don_sec"]
-    t2 = con.execute("SELECT start_sec, locked FROM tasks WHERE id=2").fetchone()
-    revs = con.execute("SELECT COUNT(*) c FROM revisions").fetchone()["c"]
+    snap = _json.loads(con.execute("SELECT snapshot FROM revisions WHERE id=?",
+                                   (new_rev,)).fetchone()["snapshot"])
+    hat_snap = next(i for i in snap["items"] if i["id"] == 2)
+    t1_snap = next(t for t in snap["tasks"] if t["id"] == 1)
+    t2_snap = next(t for t in snap["tasks"] if t["id"] == 2)
+    # 当前可变方案保持改乱状态：派生完全不触碰
+    hat_cur = con.execute("SELECT don_sec FROM items WHERE id=2").fetchone()["don_sec"]
+    t1_cur = con.execute("SELECT start_sec FROM tasks WHERE id=1").fetchone()["start_sec"]
     con.close()
-    assert hat == 6, f"建议未写回服装用时：{hat}"
-    assert t2["start_sec"] == 110 and t2["locked"] == 1, "锁定节点被派生重排移动"
-    assert revs >= 2, "派生未生成新修订"
+    assert hat_snap["don_sec"] == 6, f"新修订应写入建议值 6：{hat_snap['don_sec']}"
+    assert t1_snap["start_sec"] != 999, "当前可变方案的漂移被带入新修订"
+    assert t2_snap["start_sec"] == 110 and t2_snap["locked"] == 1, "锁定节点被派生重排移动"
+    assert hat_cur == 1 and t1_cur == 999, "派生改写了当前可变方案"
+    os.unlink(tmp)
+
+
+# ---------- 用例 7：计划漂移后回看连排仍读冻结 plan ----------
+
+def test_plan_drift_does_not_leak_into_run_view():
+    tmp = _fresh_db()
+    con = db.connect()
+    _base_scene(con)
+    con.close()
+    client = _client()
+    run_id = _make_run(client)
+    before = client.get(f"/api/runs/{run_id}").get_json()["plan"]
+
+    # 漂移当前方案：任务时刻、服装用时、场次时间全改
+    client.post("/api/tasks/1", json={"start_sec": 999})
+    client.post("/api/items/2", json={"don_sec": 99})
+    client.post("/api/scenes/1", json={"start_sec": 50, "duration_sec": 30})
+
+    after = client.get(f"/api/runs/{run_id}").get_json()["plan"]
+    assert after["windows"] == before["windows"], "冻结窗口被当前方案漂移污染"
+    assert after["scenes"] == before["scenes"], "冻结场次被当前方案漂移污染"
+    assert after["items"] == before["items"], "冻结服装被当前方案漂移污染"
+    assert after["windows"]["1"]["start"] == 100, after["windows"]["1"]
+    # 计划—实测导出同样只能来自冻结 plan
+    svg = client.get(f"/export/run/{run_id}/compare.svg").get_data(as_text=True)
+    assert svg.startswith("<svg") and "#1计划" in svg
+    os.unlink(tmp)
+
+
+# ---------- 用例 8：错误服装身份与副本编号 ----------
+
+def test_wrong_item_identity_and_copy():
+    tmp = _fresh_db()
+    con = db.connect()
+    _base_scene(con)
+    con.close()
+    client = _client()
+    run_id = _make_run(client)
+
+    # 动作1「脱·斗篷」现场错用帽子（item 2）
+    r = client.post(f"/api/runs/{run_id}/events",
+                    json={"task_id": 1, "action_idx": 1, "kind": "start",
+                          "at_sec": 106, "item_id": 2})
+    assert r.get_json()["ok"], r.get_json()
+    # 服装不在基准计划中 → 404；副本编号 0 → 400
+    r = client.post(f"/api/runs/{run_id}/events",
+                    json={"task_id": 1, "action_idx": 2, "kind": "start",
+                          "at_sec": 110, "item_id": 999})
+    assert r.status_code == 404, r.status_code
+    r = client.post(f"/api/runs/{run_id}/events",
+                    json={"task_id": 1, "action_idx": 2, "kind": "start",
+                          "at_sec": 110, "copy_id": 0})
+    assert r.status_code == 400, r.status_code
+    # 斗篷共 2 件，完成打点登记第 5 件 → 副本编号无效
+    r = client.post(f"/api/runs/{run_id}/events",
+                    json={"task_id": 1, "action_idx": 1, "kind": "done",
+                          "at_sec": 112, "copy_id": 5})
+    assert r.get_json()["ok"]
+    # 甲 130-134 用帽子#1；乙 132-136 也用帽子#1 → 同一副本重叠
+    client.post(f"/api/runs/{run_id}/events",
+                json={"task_id": 1, "action_idx": 2, "kind": "start", "at_sec": 130,
+                      "item_id": 2, "copy_id": 1})
+    client.post(f"/api/runs/{run_id}/events",
+                json={"task_id": 1, "action_idx": 2, "kind": "done", "at_sec": 134,
+                      "item_id": 2, "copy_id": 1})
+    client.post(f"/api/runs/{run_id}/events",
+                json={"task_id": 2, "action_idx": 1, "kind": "start", "at_sec": 132,
+                      "item_id": 2, "copy_id": 1})
+    client.post(f"/api/runs/{run_id}/events",
+                json={"task_id": 2, "action_idx": 1, "kind": "done", "at_sec": 136,
+                      "item_id": 2, "copy_id": 1})
+
+    d = client.get(f"/api/runs/{run_id}").get_json()
+    items_ana = [c for c in d["analysis"]["anomalies"] if c["type"] == "item"]
+    msgs = " ".join(c["message"] for c in items_ana)
+    assert "错用服装" in msgs and "帽子" in msgs and "斗篷" in msgs, \
+        f"应识别现场用错服装：{msgs}"
+    assert "副本编号无效" in msgs, f"应识别副本编号超范围：{msgs}"
+    assert "副本冲突" in msgs and "第 1 件" in msgs, f"应识别同一副本重叠：{msgs}"
+    os.unlink(tmp)
+
+
+# ---------- 用例 9：同一服装动作按不同服装师分组 ----------
+
+def test_summary_groups_by_dresser():
+    tmp = _fresh_db()
+    con = db.connect()
+    _base_scene(con)
+    con.execute("INSERT INTO dressers VALUES(2,1,'小李')")
+    con.execute("UPDATE tasks SET dresser_id=2 WHERE id=2")   # 乙改由小李照看
+    con.commit()
+    con.close()
+    client = _client()
+
+    # 王姐组（任务#1）实测 6s；小李组（任务#2）实测 12s —— 分组不得混淆
+    run_id = _make_run(client)
+    _punch(client, run_id, 1, 2, "start", 100)
+    _punch(client, run_id, 1, 2, "done", 106)
+    _punch(client, run_id, 2, 1, "start", 200)
+    _punch(client, run_id, 2, 1, "done", 212)
+    client.post(f"/api/runs/{run_id}/close")
+
+    r = client.get("/api/runs/summary?revision_id=1").get_json()
+    keys = {s["key"]: s for s in r["suggestions"]}
+    assert "2:don:1" in keys and "2:don:2" in keys, \
+        f"同一服装动作应按服装师分组：{list(keys)}"
+    assert keys["2:don:1"]["suggested"] == 6 and keys["2:don:1"]["dresser_name"] == "王姐"
+    assert keys["2:don:2"]["suggested"] == 12 and keys["2:don:2"]["dresser_name"] == "小李"
+    assert keys["2:don:1"]["n"] == 1 and keys["2:don:2"]["n"] == 1, "分组样本不得混淆"
     os.unlink(tmp)
 
 
@@ -308,5 +435,8 @@ if __name__ == "__main__":
     check("时刻倒序与动作漏项检查", test_order_and_missing_checks)
     check("服装师并发冲突 + 首个偏差与等待链", test_concurrency_first_deviation_and_chain)
     check("错用服装（单副本实测并发穿着）", test_item_copy_misuse_detected)
-    check("汇总建议与派生修订（锁定节点不动）", test_summary_and_derive_respects_locks)
+    check("基准派生：绑定基准修订、锁定不动、不污染当前方案", test_derive_binds_base_revision)
+    check("计划漂移后回看连排仍读冻结 plan", test_plan_drift_does_not_leak_into_run_view)
+    check("错误服装身份与副本编号识别", test_wrong_item_identity_and_copy)
+    check("同一服装动作按不同服装师分组", test_summary_groups_by_dresser)
     print(f"全部通过（{len(PASS)} 项）")

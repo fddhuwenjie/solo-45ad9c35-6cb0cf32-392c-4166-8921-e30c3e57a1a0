@@ -117,9 +117,20 @@ CREATE TABLE IF NOT EXISTS run_events(
   at_sec INTEGER NOT NULL,       -- 实测时刻（演出时钟秒）
   reason TEXT NOT NULL DEFAULT '', -- 异常/补正理由
   supersedes INTEGER,            -- 补正：被本事件替代的早前事件 id
+  item_id INTEGER,               -- 现场实际使用的服装/道具（NULL=按计划）
+  copy_id INTEGER,               -- 现场实际使用的副本编号（NULL=未指定）
   created_at REAL NOT NULL
 );
 """
+
+
+def _migrate(con):
+    """对已有库做增量列迁移（CREATE TABLE IF NOT EXISTS 不会补列）。"""
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(run_events)")}
+    for col in ("item_id", "copy_id"):
+        if cols and col not in cols:
+            con.execute(f"ALTER TABLE run_events ADD COLUMN {col} INTEGER")
+    con.commit()
 
 
 def connect():
@@ -133,6 +144,7 @@ def connect():
 def init_db():
     con = connect()
     con.executescript(SCHEMA)
+    _migrate(con)
     con.commit()
     con.close()
 
@@ -192,6 +204,20 @@ def save_revision(note, production_id=1):
             (production_id, time.time(), note, json.dumps(snap, ensure_ascii=False)),
         )
         con.commit()
+    finally:
+        con.close()
+
+
+def save_snapshot_revision(snap, note, production_id=1):
+    """直接把给定快照（scenes/tasks/items）存为新修订——用于从基准派生，
+    不触碰当前可变方案。"""
+    con = connect()
+    try:
+        cur = con.execute(
+            "INSERT INTO revisions(production_id,created_at,note,snapshot) VALUES(?,?,?,?)",
+            (production_id, time.time(), note, json.dumps(snap, ensure_ascii=False)))
+        con.commit()
+        return cur.lastrowid
     finally:
         con.close()
 
@@ -272,13 +298,15 @@ def close_run(run_id):
         con.close()
 
 
-def add_event(run_id, task_id, action_idx, kind, at_sec, reason="", supersedes=None):
+def add_event(run_id, task_id, action_idx, kind, at_sec, reason="", supersedes=None,
+              item_id=None, copy_id=None):
     con = connect()
     try:
         cur = con.execute(
-            "INSERT INTO run_events(run_id,task_id,action_idx,kind,at_sec,reason,supersedes,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            (run_id, task_id, action_idx, kind, int(at_sec), reason, supersedes, time.time()))
+            "INSERT INTO run_events(run_id,task_id,action_idx,kind,at_sec,reason,supersedes,"
+            "item_id,copy_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (run_id, task_id, action_idx, kind, int(at_sec), reason, supersedes,
+             item_id, copy_id, time.time()))
         con.commit()
         return cur.lastrowid
     finally:

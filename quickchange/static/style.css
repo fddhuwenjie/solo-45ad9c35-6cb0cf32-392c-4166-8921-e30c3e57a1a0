@@ -72,6 +72,9 @@ svg text { user-select: none; }
 .punch-row .pplan { color: #888; font-size: 11px; }
 .punch-row .pstate { color: #2c3e50; font-size: 11px; }
 .punch-row .pbtns { margin-left: auto; display: flex; gap: 4px; }
+.pitem { width: 92px; padding: 1px 2px; font-size: 11px; }
+.pitem.wrong { border: 1px solid #c0392b; background: #fdedec; }
+.pcopy { width: 48px; padding: 1px 3px; font-size: 11px; }
 .pbtn { padding: 2px 8px; font-size: 11px; background: #3498db; }
 .pbtn.done { background: #27ae60; }
 .pbtn.skip { background: #95a5a6; }

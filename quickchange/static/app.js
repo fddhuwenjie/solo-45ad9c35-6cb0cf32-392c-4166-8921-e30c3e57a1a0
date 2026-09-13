@@ -49,92 +49,110 @@ function txt(parent, x, y, str, attrs = {}) {
 function renderTimeline() {
   const svg = $("#timeline");
   svg.innerHTML = "";
+  // 回看连排时：计划条、泳道、场次全部读取该连排冻结的 plan，
+  // 与实测同轴同源，不混入当前可变方案（S.schedule）。
+  const actors = R ? R.plan.actors : S.actors;
+  const tasks = R ? R.plan.tasks : S.tasks;
+  const windows = R ? R.plan.windows : S.schedule.windows;
+  const scenes = R ? R.plan.scenes : S.scenes;
   const laneOf = {};
-  S.actors.forEach((a, i) => (laneOf[a.id] = i));
+  actors.forEach((a, i) => (laneOf[a.id] = i));
   const laneH = R ? 46 : TL.laneH;   // 选中连排时泳道加高，同轴叠放实测
-  const h = TL.top + S.actors.length * laneH + 24;
+  const h = TL.top + actors.length * laneH + 24;
   svg.setAttribute("height", h);
+  const total = Math.max(600, ...scenes.map((s) => s.start_sec + s.duration_sec)) + 60;
+  const xOfT = (t) => TL.left + (t / total) * (TL.right - TL.left);
 
   // 场次条与刻度
-  S.scenes.forEach((s) => {
-    el("rect", { x: xOf(s.start_sec), y: 14, width: (s.duration_sec / totalTime()) * (TL.right - TL.left),
+  scenes.forEach((s) => {
+    el("rect", { x: xOfT(s.start_sec), y: 14, width: (s.duration_sec / total) * (TL.right - TL.left),
                  height: 14, fill: "#e8eef7", rx: 2 }, svg);
-    txt(svg, xOf(s.start_sec) + 3, 24, s.name, { fill: "#456" });
+    txt(svg, xOfT(s.start_sec) + 3, 24, s.name, { fill: "#456" });
   });
-  for (let t = 0; t <= totalTime(); t += 300) {
-    el("line", { x1: xOf(t), y1: TL.top - 4, x2: xOf(t), y2: h - 20, stroke: "#f0f0f0" }, svg);
-    txt(svg, xOf(t) - 10, h - 8, fmt(t), { fill: "#aaa" });
+  for (let t = 0; t <= total; t += 300) {
+    el("line", { x1: xOfT(t), y1: TL.top - 4, x2: xOfT(t), y2: h - 20, stroke: "#f0f0f0" }, svg);
+    txt(svg, xOfT(t) - 10, h - 8, fmt(t), { fill: "#aaa" });
   }
   // 演员泳道
-  S.actors.forEach((a, i) => {
+  actors.forEach((a, i) => {
     const y = TL.top + i * laneH;
     txt(svg, 8, y + laneH / 2 + 4, a.name, { "font-size": 12, fill: "#333" });
     el("line", { x1: TL.left, y1: y + laneH, x2: TL.right, y2: y + laneH, stroke: "#eee" }, svg);
   });
 
-  const W = S.schedule.windows;
-  // 任务块（计划）
-  S.tasks.forEach((t) => {
-    const w = W[t.id];
-    if (!w) return;
+  // 任务块（计划）：回看模式为冻结快照，只读不可拖
+  tasks.forEach((t) => {
+    const w = windows[t.id];
+    if (!w || laneOf[t.actor_id] === undefined) return;
     const y = TL.top + laneOf[t.actor_id] * laneH + (R ? 4 : 7);
     const bh = R ? 13 : 26;
-    const g = el("g", { class: "tblock" + (t.locked ? " locked" : "") +
+    const g = el("g", { class: "tblock" + ((t.locked || R) ? " locked" : "") +
                         (t.id === selectedTask ? " selected" : ""), "data-id": t.id }, svg);
-    const color = !w.ok ? "#c0392b" : t.locked ? "#7f8c8d" : t.needs_review ? "#e67e22" : "#2980b9";
-    el("rect", { x: xOf(w.start), y, width: Math.max(6, xOf(w.end) - xOf(w.start)),
+    const color = !w.ok ? "#c0392b" : t.locked ? "#7f8c8d"
+      : (!R && t.needs_review) ? "#e67e22" : "#2980b9";
+    el("rect", { x: xOfT(w.start), y, width: Math.max(6, xOfT(w.end) - xOfT(w.start)),
                  height: bh, rx: 4, fill: color, opacity: 0.9 }, g);
-    txt(g, xOf(w.start) + 4, y + (R ? 10 : 16), `#${t.id}${t.locked ? "🔒" : ""}`, { fill: "#fff" });
+    txt(g, xOfT(w.start) + 4, y + (R ? 10 : 16), `#${t.id}${t.locked ? "🔒" : ""}`, { fill: "#fff" });
     // 截止线
-    el("line", { x1: xOf(w.deadline), y1: y - 3, x2: xOf(w.deadline), y2: y + bh + 3,
+    el("line", { x1: xOfT(w.deadline), y1: y - 3, x2: xOfT(w.deadline), y2: y + bh + 3,
                  stroke: "#c0392b", "stroke-dasharray": "3 2" }, g);
-    g.addEventListener("pointerdown", (ev) => startDrag(ev, t));
+    if (!R) g.addEventListener("pointerdown", (ev) => startDrag(ev, t));
     g.addEventListener("click", () => { selectedTask = t.id; renderAll(); });
   });
-  // 实测条（选中连排时叠放）
+  // 实测条（选中连排时叠放，与冻结计划同轴）
   if (R) {
     const ivs = R.analysis.task_intervals;
-    S.tasks.forEach((t) => {
-      const w = W[t.id];
-      if (!w) return;
+    tasks.forEach((t) => {
+      const w = windows[t.id];
+      if (!w || laneOf[t.actor_id] === undefined) return;
       const y = TL.top + laneOf[t.actor_id] * laneH + 22;
       const iv = ivs[String(t.id)];
       if (iv) {
         const late = iv[1] > w.end + 5;
-        el("rect", { x: xOf(iv[0]), y, width: Math.max(5, xOf(iv[1]) - xOf(iv[0])),
+        el("rect", { x: xOfT(iv[0]), y, width: Math.max(5, xOfT(iv[1]) - xOfT(iv[0])),
                      height: 13, rx: 3, fill: late ? "#c0392b" : "#27ae60", opacity: 0.9 }, svg);
-        txt(svg, xOf(iv[0]) + 3, y + 10, "实测", { fill: "#fff", "font-size": 9 });
+        txt(svg, xOfT(iv[0]) + 3, y + 10, "实测", { fill: "#fff", "font-size": 9 });
       } else {
-        txt(svg, xOf(w.start) + 3, y + 10, "未打点", { fill: "#bbb", "font-size": 9 });
+        txt(svg, xOfT(w.start) + 3, y + 10, "未打点", { fill: "#bbb", "font-size": 9 });
       }
     });
     // 异常打点（有效、未被补正）
     const superseded = new Set(R.events.filter((e) => e.supersedes).map((e) => e.supersedes));
     R.events.filter((e) => e.kind === "exception" && !superseded.has(e.id)).forEach((e) => {
-      const t = S.tasks.find((x) => x.id === e.task_id);
-      if (!t) return;
+      const t = tasks.find((x) => x.id === e.task_id);
+      if (!t || laneOf[t.actor_id] === undefined) return;
       const y = TL.top + laneOf[t.actor_id] * laneH;
-      el("path", { d: `M${xOf(e.at_sec)},${y + 40} l4,-7 l4,7 z`, fill: "#e74c3c" }, svg);
-      txt(svg, xOf(e.at_sec) + 6, y + 40, e.reason.slice(0, 14), { fill: "#c0392b", "font-size": 9 });
+      el("path", { d: `M${xOfT(e.at_sec)},${y + 40} l4,-7 l4,7 z`, fill: "#e74c3c" }, svg);
+      txt(svg, xOfT(e.at_sec) + 6, y + 40, e.reason.slice(0, 14), { fill: "#c0392b", "font-size": 9 });
     });
     // 首个偏差
     const fd = R.analysis.first_deviation;
     if (fd) {
-      const t = S.tasks.find((x) => x.id === fd.task_id);
-      if (t) {
+      const t = tasks.find((x) => x.id === fd.task_id);
+      if (t && laneOf[t.actor_id] !== undefined) {
         const y = TL.top + laneOf[t.actor_id] * laneH;
-        el("path", { d: `M${xOf(fd.time)},${y - 2} l5,8 l-10,0 z`, fill: "#e67e22" }, svg);
-        txt(svg, xOf(fd.time) + 6, y + 2, `首个偏差 #${fd.task_id}`, { fill: "#d35400", "font-size": 9 });
+        el("path", { d: `M${xOfT(fd.time)},${y - 2} l5,8 l-10,0 z`, fill: "#e67e22" }, svg);
+        txt(svg, xOfT(fd.time) + 6, y + 2, `首个偏差 #${fd.task_id}`, { fill: "#d35400", "font-size": 9 });
       }
     }
+    // 实测检查三角（连排自己的检查，不混入当前方案冲突）
+    const ACOLOR = { order: "#9b59b6", missing: "#e67e22", concurrency: "#e74c3c", item: "#16a085" };
+    R.analysis.anomalies.forEach((c) => {
+      const t = tasks.find((x) => x.id === c.task_id);
+      if (!t || laneOf[t.actor_id] === undefined) return;
+      const y = TL.top + laneOf[t.actor_id] * laneH;
+      el("path", { d: `M${xOfT(c.time)},${y + 4} l5,-9 l5,9 z`,
+                   fill: ACOLOR[c.type] || "#e74c3c" }, svg);
+    });
+    return;
   }
-  // 冲突三角
+  // 冲突三角（当前方案）
   S.schedule.conflicts.forEach((c) => {
     const t = S.tasks.find((x) => x.id === c.task_id);
     if (!t) return;
     const y = TL.top + laneOf[t.actor_id] * laneH;
     const color = c.type === "review" ? "#e67e22" : "#e74c3c";
-    el("path", { d: `M${xOf(c.time)},${y + 4} l5,-9 l5,9 z`, fill: color }, svg);
+    el("path", { d: `M${xOfT(c.time)},${y + 4} l5,-9 l5,9 z`, fill: color }, svg);
   });
 }
 
@@ -470,7 +488,7 @@ function parseClock() {
   return null;
 }
 
-async function punch(tid, idx, kind, existing) {
+async function punch(tid, idx, kind, existing, row) {
   if (!R || R.run.status !== "open") return alert("连排未在进行中");
   const at = parseClock();
   if (at === null) return;
@@ -482,8 +500,16 @@ async function punch(tid, idx, kind, existing) {
     reason = prompt(`补正理由（必填，原记录 ${fmt(existing.at_sec)} 保留备查）：`, "");
     if (!reason) return alert("补正必须填写理由");
   }
+  // 现场实际使用的服装/副本（穿脱动作行内选择；空=按计划）
+  let item_id = null, copy_id = null;
+  if (row && (kind === "start" || kind === "done")) {
+    const isel = row.querySelector(".pitem");
+    const csel = row.querySelector(".pcopy");
+    if (isel && isel.value !== "") item_id = +isel.value;
+    if (csel && csel.value !== "") copy_id = +csel.value;
+  }
   const res = await api(`/api/runs/${R.run.id}/events`, "POST",
-    { task_id: tid, action_idx: idx, kind, at_sec: at, reason });
+    { task_id: tid, action_idx: idx, kind, at_sec: at, reason, item_id, copy_id });
   if (res && res.ok === false) return alert(res.error || "打点被拒绝");
   R = res.run;
   renderAll();
@@ -526,16 +552,29 @@ function renderPunch() {
     const notes = exc.map((e) => `<span class="tag exc">⚑${e.reason}</span>`).join("") +
       [evS, evD, evK].filter((e) => e && e.reason)
         .map((e) => `<span class="tag corr">补正:${e.reason}</span>`).join("");
+    // 穿/脱动作：现场实际使用的服装（默认基准计划）与副本编号
+    let itemCtl = "";
+    if ((a.kind === "don" || a.kind === "doff") && a.item_id != null) {
+      const used = (evS && evS.item_id) || (evD && evD.item_id) || a.item_id;
+      const usedCopy = (evS && evS.copy_id) || (evD && evD.copy_id) || "";
+      const opts = R.plan.items.filter((i) => i.kind !== "prop").map((i) =>
+        `<option value="${i.id}" ${i.id === used ? "selected" : ""}>${i.name}</option>`).join("");
+      const wrong = used !== a.item_id ? " wrong" : "";
+      itemCtl = `<select class="pitem${wrong}" ${open ? "" : "disabled"}>${opts}</select>` +
+        `<input class="pcopy" type="number" min="1" placeholder="副本#" value="${usedCopy}" ` +
+        `title="现场实际使用的副本编号" ${open ? "" : "disabled"}>`;
+    }
     return `<div class="punch-row"><span class="pidx">${a.idx}</span>` +
       `<span class="plabel">${a.label}</span><span class="pplan">计划 ${fmt(a.start)} (${a.dur}s)</span>` +
-      `<span class="pstate">${state}</span>${notes}<span class="pbtns">${btns}</span></div>`;
+      `${itemCtl}<span class="pstate">${state}</span>${notes}<span class="pbtns">${btns}</span></div>`;
   }).join("");
   box.innerHTML = html;
   const sel = $("#punch-task");
   sel.onchange = () => { selectedTask = +sel.value; renderAll(); };
   box.querySelectorAll(".pbtn").forEach((b) => {
     b.onclick = () => punch(+b.dataset.t, +b.dataset.i, b.dataset.k,
-      b.dataset.ex !== "" ? { at_sec: +b.dataset.ex } : null);
+      b.dataset.ex !== "" ? { at_sec: +b.dataset.ex } : null,
+      b.closest(".punch-row"));
   });
 }
 
@@ -567,26 +606,34 @@ function renderRunChecks() {
 
 async function renderSummary() {
   const box = $("#run-summary");
-  const res = await api("/api/runs/summary");
-  const sg = res.suggestions || [];
-  if (!sg.length) {
-    box.innerHTML = '<p class="muted">暂无建议（需要已结束的连排，且实测 P75 与基准不同）</p>';
+  if (!R) {
+    box.innerHTML = '<p class="muted">选择左侧连排后，按其基准修订汇总建议并派生</p>';
     return;
   }
-  box.innerHTML = `<table class="sumtab"><tr><th></th><th>服装</th><th>动作</th><th>配置</th>` +
+  const res = await api(`/api/runs/summary?revision_id=${R.run.revision_id}`);
+  const sg = res.suggestions || [];
+  if (!sg.length) {
+    box.innerHTML = `<p class="muted">基准修订#${R.run.revision_id} 暂无建议` +
+      `（需要基于该修订的已结束连排，且实测 P75 与基准不同）</p>`;
+    return;
+  }
+  box.innerHTML = `<div class="muted">基准修订#${R.run.revision_id}｜按服装动作 × 人员配置分组（P75）</div>` +
+    `<table class="sumtab"><tr><th></th><th>服装</th><th>动作</th><th>服装师</th>` +
     `<th>基准</th><th>建议</th><th>样本</th></tr>` + sg.map((s) =>
       `<tr><td><input type="checkbox" class="sumchk" data-k="${s.key}"></td>` +
       `<td>${s.item_name}</td><td>${s.action === "don" ? "穿上" : "脱下"}</td>` +
-      `<td>${s.staffed ? "有服装师" : "自助"}</td><td>${s.current}s</td>` +
+      `<td>${s.dresser_name || "自助"}</td><td>${s.current}s</td>` +
       `<td><b>${s.suggested}s</b></td><td>${s.n} 次（${s.min}–${s.max}s）</td></tr>`).join("") +
-    `</table><button id="btn-derive">勾选建议并派生修订（只重排受影响任务，已锁不动）</button>`;
+    `</table><button id="btn-derive">勾选建议并派生修订（从基准修订#${R.run.revision_id} 生成，` +
+    `只重排受影响任务，已锁不动）</button>`;
   $("#btn-derive").onclick = async () => {
     const keys = [...box.querySelectorAll(".sumchk")].filter((c) => c.checked)
       .map((c) => c.dataset.k);
     if (!keys.length) return alert("请先勾选建议");
-    const res2 = await api("/api/runs/derive", "POST", { keys });
+    const res2 = await api("/api/runs/derive", "POST", { run_id: R.run.id, keys });
     if (res2 && res2.ok === false) return alert(res2.error || "派生失败");
-    alert(res2.derived ? res2.derived.note : "已派生");
+    alert(res2.derived ? `${res2.derived.note}\n已生成修订#${res2.derived.revision_id}，可在修订记录中恢复使用`
+                       : "已派生");
     await refresh(res2);
   };
 }

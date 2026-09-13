@@ -210,33 +210,69 @@ def analyze(run, events):
                                   "message": f"换装位容量超限：{pos['name']} 实测并发 {cur}"
                                              f" 超过容量 {pos['capacity']}"})
 
-    # 3) 服装副本：实测穿着区间并发不得超件数；脱下被跳过记错用
+    # 3) 服装身份与副本：以打点记录的现场 item_id/copy_id 为准（NULL=按计划）
     items = {i["id"]: i for i in plan["items"]}
     scenes = {s["id"]: s for s in plan["scenes"]}
+
+    def item_name(iid):
+        return items[iid]["name"] if iid in items else f"#{iid}"
+
+    # 3a) 身份与副本编号校验：现场使用的服装与基准不符、副本编号超出件数
+    #     （开始/完成两个有效打点分别校验，同一动作同类问题只报一次）
+    for a in plan["actions"]:
+        if a["kind"] not in ("don", "doff") or a.get("item_id") is None:
+            continue
+        tid = a["task_id"]
+        seen = set()
+        for ev in (eff.get((tid, a["idx"], "start")), eff.get((tid, a["idx"], "done"))):
+            if not ev:
+                continue
+            actual_iid = ev["item_id"] if ev["item_id"] is not None else a["item_id"]
+            if actual_iid != a["item_id"] and ("item", actual_iid) not in seen:
+                seen.add(("item", actual_iid))
+                anomalies.append({"type": "item", "task_id": tid, "time": ev["at_sec"],
+                                  "message": f"错用服装：动作{a['idx']}「{a['label']}」现场使用"
+                                             f"「{item_name(actual_iid)}」，基准要求"
+                                             f"「{item_name(a['item_id'])}」"})
+            cp = ev["copy_id"]
+            if cp is None or ("copy", cp) in seen:
+                continue
+            it = items.get(actual_iid)
+            cap = it["copies"] if it else None
+            if cp < 1 or (cap is not None and cp > cap):
+                seen.add(("copy", cp))
+                anomalies.append({"type": "item", "task_id": tid, "time": ev["at_sec"],
+                                  "message": f"副本编号无效：「{item_name(actual_iid)}」"
+                                             f"第 {cp} 件（基准共 {cap} 件）"})
+
+    # 3b) 实测穿着区间按现场实际服装构建；脱下被跳过记错用
     dons, doffs = {}, {}
     for a in plan["actions"]:
-        iid = a.get("item_id")
-        if iid is None:
+        if a["kind"] not in ("don", "doff") or a.get("item_id") is None:
             continue
-        ac = actuals[(a["task_id"], a["idx"])]
         tid = a["task_id"]
+        ev_s = eff.get((tid, a["idx"], "start"))
+        ev_d = eff.get((tid, a["idx"], "done"))
+        ev_k = eff.get((tid, a["idx"], "skip"))
         order = plan["windows"].get(tid, {}).get("start", 0)
-        key = (tasks[tid]["actor_id"], iid)
-        if a["kind"] == "don" and ac["start"] is not None:
-            dons.setdefault(key, []).append((order, ac["start"], tid,
-                                             tasks[tid]["to_scene_id"]))
+        actor = tasks[tid]["actor_id"]
+        if a["kind"] == "don" and ev_s:
+            iid = ev_s["item_id"] if ev_s["item_id"] is not None else a["item_id"]
+            dons.setdefault((actor, iid), []).append(
+                (order, ev_s["at_sec"], tid, tasks[tid]["to_scene_id"], ev_s["copy_id"]))
         if a["kind"] == "doff":
-            if ac["end"] is not None:
-                doffs.setdefault(key, []).append((order, ac["end"]))
-            elif ac["skipped"]:
+            if ev_d:
+                iid = ev_d["item_id"] if ev_d["item_id"] is not None else a["item_id"]
+                doffs.setdefault((actor, iid), []).append((order, ev_d["at_sec"]))
+            elif ev_k:
                 anomalies.append({"type": "item", "task_id": tid, "time": a["start"],
-                                  "message": f"错用服装：「{items[iid]['name']}」脱下被跳过，"
-                                             f"副本未回收"})
-    wear = {}
-    for key, dl in dons.items():
+                                  "message": f"错用服装：「{item_name(a['item_id'])}」"
+                                             f"脱下被跳过，副本未回收"})
+    wear = {}   # iid -> [(start, end, task_id, copy_id|None)]
+    for (actor, iid), dl in dons.items():
         dl.sort()
-        dl_doff = sorted(doffs.get(key, []))
-        for order, st, tid, to_sid in dl:
+        dl_doff = sorted(doffs.get((actor, iid), []))
+        for order, st, tid, to_sid, cp in dl:
             rel = None
             while dl_doff and dl_doff[0][0] <= order:
                 dl_doff.pop(0)
@@ -245,10 +281,28 @@ def analyze(run, events):
             if rel is None:
                 sc = scenes.get(to_sid)
                 rel = (sc["start_sec"] + sc["duration_sec"]) if sc else st
-            wear.setdefault(key[1], []).append((st, max(rel, st), tid))
+            wear.setdefault(iid, []).append((st, max(rel, st), tid, cp))
+
+    # 3c) 同一件副本被重叠使用（打点声明了副本编号的精确冲突）
     for iid, ivs in wear.items():
+        by_copy = {}
+        for s, e, tid, cp in ivs:
+            if cp is not None:
+                by_copy.setdefault(cp, []).append((s, e, tid))
+        for cp, lst in by_copy.items():
+            lst.sort()
+            for x, y in zip(lst, lst[1:]):
+                if y[0] < x[1]:
+                    anomalies.append({"type": "item", "task_id": y[2], "time": y[0],
+                                      "message": f"副本冲突：「{item_name(iid)}」第 {cp} 件"
+                                                 f"在任务#{x[2]}与#{y[2]}的实测区间重叠"})
+
+    # 3d) 总数超件数（存在未声明副本的区间时的兜底检查）
+    for iid, ivs in wear.items():
+        if all(cp is not None for _, _, _, cp in ivs):
+            continue  # 全部声明了副本：由 3c 精确检查覆盖
         pts = []
-        for s, e, tid in ivs:
+        for s, e, tid, _ in ivs:
             pts.append((s, 1, tid))
             pts.append((e, -1, tid))
         pts.sort(key=lambda x: (x[0], x[1]))
@@ -258,7 +312,7 @@ def analyze(run, events):
             cur += d
             if cur > cap:
                 anomalies.append({"type": "item", "task_id": tid, "time": t,
-                                  "message": f"错用服装：「{items[iid]['name']}」实测并发穿着 "
+                                  "message": f"错用服装：「{item_name(iid)}」实测并发穿着 "
                                              f"{cur} 件，超过副本数 {cap}"})
 
     anomalies.sort(key=lambda c: (c["time"], c["task_id"]))
@@ -427,16 +481,22 @@ def _p75(samples):
     return s[max(0, math.ceil(0.75 * len(s)) - 1)]
 
 
-def summarize_suggestions(state, production_id=1):
-    """按服装动作（件×穿/脱）与人员配置（有无服装师）汇总已结束连排的实测时长，
-    以 P75 为建议值，与当前基准的 don_sec/doff_sec 对比给出建议。"""
+def summarize_suggestions(state, production_id=1, revision_id=None):
+    """按服装动作（件×穿/脱）与完整人员配置（具体服装师/自助）汇总已结束连排的
+    实测时长，以 P75 为建议值。revision_id 给定时只汇总基于该基准修订的连排，
+    且「基准值」取自该修订的冻结服装用时。"""
     runs = [r for r in db.list_runs(production_id) if r["status"] == "done"]
-    groups = {}
+    if revision_id is not None:
+        runs = [r for r in runs if r["revision_id"] == revision_id]
+    groups = {}          # (item_id, kind, dresser_id|None) -> [dur]
+    dresser_names = {}
     for r in runs:
         plan = load_plan(db.get_run(r["id"]))
         events = db.run_events(r["id"])
         eff = effective_events(events)
         tasks = {t["id"]: t for t in plan["tasks"]}
+        for d in plan["dressers"]:
+            dresser_names[d["id"]] = d["name"]
         for a in plan["actions"]:
             if a["kind"] not in ("don", "doff") or a.get("item_id") is None:
                 continue
@@ -447,13 +507,18 @@ def summarize_suggestions(state, production_id=1):
             dur = ev_d["at_sec"] - ev_s["at_sec"]
             if not 0 < dur < 900:
                 continue
-            staffed = tasks[a["task_id"]]["dresser_id"] is not None
-            key = (a["item_id"], a["kind"], staffed)
-            groups.setdefault(key, []).append(dur)
+            dr = tasks[a["task_id"]]["dresser_id"]   # 完整人员配置：具体服装师/自助
+            groups.setdefault((a["item_id"], a["kind"], dr), []).append(dur)
 
-    items = {i["id"]: i for i in state["items"]}
+    if revision_id is not None:
+        rev = db.get_revision(revision_id)
+        snap_items = json.loads(rev["snapshot"])["items"] if rev else []
+        items = {i["id"]: i for i in snap_items}
+    else:
+        items = {i["id"]: i for i in state["items"]}
     out = []
-    for (iid, kind, staffed), samples in sorted(groups.items()):
+    for (iid, kind, dr), samples in sorted(groups.items(),
+                                           key=lambda x: (x[0][0], x[0][1], x[0][2] or 0)):
         it = items.get(iid)
         if not it:
             continue
@@ -463,50 +528,68 @@ def summarize_suggestions(state, production_id=1):
         if suggested == current:
             continue
         out.append({
-            "key": f"{iid}:{kind}:{int(staffed)}",
+            "key": f"{iid}:{kind}:{dr or 0}",
             "item_id": iid, "item_name": it["name"],
-            "action": kind, "staffed": staffed,
+            "action": kind, "dresser_id": dr,
+            "dresser_name": dresser_names.get(dr) if dr else None,
+            "staffed": dr is not None,
             "current": current, "suggested": suggested,
             "n": len(samples), "min": min(samples), "max": max(samples),
         })
     return out
 
 
-def derive_revision(accepted_keys, production_id=1):
-    """勾选建议 → 改写服装用时 → 仅重排受影响任务（已锁不动）→ 存档为新修订。"""
-    state = db.load_state(production_id)
-    sugg = summarize_suggestions(state, production_id)
+def derive_revision(run_id, accepted_keys, production_id=1):
+    """从所选连排的基准修订派生新修订：建议写回冻结服装用时 → 在冻结方案上
+    重排 → 只把受影响任务（窗口开始变化）的开始时刻写回快照，锁定节点不动。
+    全程不读写当前可变方案（scenes/tasks/items 表），产物仅为一个新修订。"""
+    run = db.get_run(run_id)
+    if not run:
+        return None
+    rev = db.get_revision(run["revision_id"])
+    if not rev:
+        return None
+    snap = json.loads(rev["snapshot"])          # 冻结基准：scenes/tasks/items
+    state = db.load_state(production_id)        # 仅取辅助数据（造型/人员/位置/服装车）
+    sugg = summarize_suggestions(state, production_id, revision_id=rev["id"])
     chosen = [s for s in sugg if s["key"] in set(accepted_keys)]
     if not chosen:
         return None
-    old = scheduler.compute_schedule(state)
-    con = db.connect()
-    try:
-        for s in chosen:
-            field = "don_sec" if s["action"] == "don" else "doff_sec"
-            con.execute(f"UPDATE items SET {field}=? WHERE id=?",
-                        (s["suggested"], s["item_id"]))
-        con.commit()
-    finally:
-        con.close()
-    new_state = db.load_state(production_id)
-    new = scheduler.compute_schedule(new_state)
+    # 同一服装动作的多个人员配置组被同时勾选：以样本最多组的建议值为准
+    best = {}
+    for s in chosen:
+        k = (s["item_id"], s["action"])
+        if k not in best or s["n"] > best[k]["n"]:
+            best[k] = s
+
+    def frozen_state(items):
+        st = dict(state)
+        st["scenes"], st["tasks"], st["items"] = snap["scenes"], snap["tasks"], items
+        return st
+
+    old = scheduler.compute_schedule(frozen_state(snap["items"]))
+    new_items = [dict(i) for i in snap["items"]]
+    for s in best.values():
+        field = "don_sec" if s["action"] == "don" else "doff_sec"
+        for i in new_items:
+            if i["id"] == s["item_id"]:
+                i[field] = s["suggested"]
+    new = scheduler.compute_schedule(frozen_state(new_items))
+
     moved = 0
-    con = db.connect()
-    try:
-        for t in new_state["tasks"]:
-            if t["locked"]:
-                continue  # 锁定节点仍不移动
-            w_old, w_new = old["windows"].get(t["id"]), new["windows"].get(t["id"])
-            if w_old and w_new and int(w_old["start"]) != int(w_new["start"]):
-                con.execute("UPDATE tasks SET start_sec=? WHERE id=?",
-                            (int(w_new["start"]), t["id"]))
-                moved += 1
-        con.commit()
-    finally:
-        con.close()
-    note = (f"连排实测派生：调整 {len(chosen)} 项服装用时"
-            f"（{', '.join(s['item_name'] for s in chosen)}），"
-            f"重排 {moved} 个受影响任务（已锁未动）")
-    db.save_revision(note, production_id)
-    return {"applied": chosen, "moved": moved, "note": note}
+    new_tasks = []
+    for t in snap["tasks"]:
+        t = dict(t)
+        w_old, w_new = old["windows"].get(t["id"]), new["windows"].get(t["id"])
+        if not t["locked"] and w_old and w_new \
+                and int(w_old["start"]) != int(w_new["start"]):
+            t["start_sec"] = int(w_new["start"])
+            moved += 1
+        new_tasks.append(t)
+    names = "、".join(s["item_name"] for s in best.values())
+    note = (f"连排#{run_id} 基准派生（修订#{rev['id']}）：调整 {len(best)} 项服装用时"
+            f"（{names}），重排 {moved} 个受影响任务（已锁未动）")
+    new_snap = {"scenes": snap["scenes"], "tasks": new_tasks, "items": new_items}
+    rev_id = db.save_snapshot_revision(new_snap, note, production_id)
+    return {"revision_id": rev_id, "moved": moved, "note": note,
+            "applied": list(best.values())}
