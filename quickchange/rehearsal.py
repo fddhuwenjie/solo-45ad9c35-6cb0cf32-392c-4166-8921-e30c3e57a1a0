@@ -114,16 +114,18 @@ def _parse_ids(raw):
 
 
 def _event_participants(events, eff, tid, idx, plan_action):
-    """该动作实测参与者：开始打点登记的 dresser_ids 为准（开始/完成合并取并集），
-    未登记则回退冻结分工（旧连排兼容）。"""
+    """该动作实测参与者：开始/完成打点显式登记的 dresser_ids（空列表=无人参与，
+    显式区别于未登记）；两类打点都未登记时回退冻结分工（旧连排兼容）。"""
     ids = []
+    explicit = False
     for kind in ("start", "done"):
         ev = eff.get((tid, idx, kind))
-        if ev and ev["dresser_ids"]:
+        if ev and ev["dresser_ids"] is not None:
+            explicit = True
             for x in _parse_ids(ev["dresser_ids"]):
                 if x not in ids:
                     ids.append(x)
-    if not ids:
+    if not explicit:
         ids = list(plan_action.get("staff_ids") or [])
     return ids
 

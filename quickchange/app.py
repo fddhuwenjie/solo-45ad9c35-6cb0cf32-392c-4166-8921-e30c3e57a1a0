@@ -304,13 +304,27 @@ def api_dresser_profile(did):
             "SELECT skill_id FROM dresser_skills WHERE dresser_id=?", (did,))}
         skill_changed = ("skill_ids" in data and new_skills != old_skills)
         side_changed = ("sides" in data and new_sides != old_sides)
-        # 仅标记该服装师实际参与的具体动作（不整任务标红）
+        # 只标记资格状态真正翻转的具体动作（合格↔不合格），不整任务标红
         if skill_changed or side_changed:
-            tids = [r["task_id"] for r in con.execute(
-                "SELECT DISTINCT task_id FROM action_staff WHERE dresser_id=?",
-                (did,)).fetchall()]
-            _mark_action_review(con, tids,
-                                "服装师技能变更" if skill_changed else "可支援侧台变更")
+            pre = db.load_state(PID)
+            affected = scheduler.staff_affected_keys(
+                pre, did, old_skills, new_skills, old_sides, new_sides)
+            for tid, kind, item_id, seq, now_bad in affected:
+                # 只有失去资格（合格→不合格）才需要复核；获得资格不阻断计划
+                if not now_bad:
+                    continue
+                exists = con.execute(
+                    "SELECT 1 FROM action_reviews WHERE production_id=? AND task_id=? "
+                    "AND kind=? AND COALESCE(item_id,-1)=COALESCE(?,-1) AND seq=?",
+                    (PID, tid, kind, item_id, seq)).fetchone()
+                reason = "服装师失去所需" + \
+                    ("技能/侧台资格" if skill_changed and side_changed
+                     else "技能" if skill_changed else "侧台支援")
+                if not exists:
+                    con.execute(
+                        "INSERT INTO action_reviews(production_id,task_id,kind,item_id,seq,"
+                        "reason,created_at) VALUES(?,?,?,?,?,?,?)",
+                        (PID, tid, kind, item_id, seq, reason, time.time()))
         con.commit()
     finally:
         con.close()
@@ -349,8 +363,29 @@ def api_create(entity):
         cur = con.execute(
             f"INSERT INTO {entity}(production_id{',' if cols else ''}{','.join(cols)}) "
             f"VALUES(?{',?'*len(cols)})", [PID] + vals)
-        con.commit()
         new_id = cur.lastrowid
+        # 不可用时段：只标记该人员与之时间相交的具体动作待复核
+        if entity == "dresser_unavailable" and {"start_sec", "end_sec"} <= set(data):
+            u0, u1 = int(data["start_sec"]), int(data["end_sec"])
+            did = int(data["dresser_id"])
+            if u1 <= u0:
+                con.rollback()
+                return jsonify({"ok": False, "error": "结束时刻必须晚于开始时刻"}), 400
+            pre = db.load_state(PID)
+            for tid, kind, item_id, seq in \
+                    scheduler.staff_unavailable_keys(pre, did, u0, u1):
+                exists = con.execute(
+                    "SELECT 1 FROM action_reviews WHERE production_id=? AND task_id=? "
+                    "AND kind=? AND COALESCE(item_id,-1)=COALESCE(?,-1) AND seq=?",
+                    (PID, tid, kind, item_id, seq)).fetchone()
+                if not exists:
+                    con.execute(
+                        "INSERT INTO action_reviews(production_id,task_id,kind,item_id,seq,"
+                        "reason,created_at) VALUES(?,?,?,?,?,?,?)",
+                        (PID, tid, kind, item_id, seq,
+                         f"服装师 {scheduler.fmt(u0)}–{scheduler.fmt(u1)} 不可用",
+                         time.time()))
+        con.commit()
     finally:
         con.close()
     return jsonify({"ok": True, "id": new_id})

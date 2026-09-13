@@ -444,7 +444,8 @@ def add_event(run_id, task_id, action_idx, kind, at_sec, reason="", supersedes=N
             "item_id,copy_id,dresser_ids,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (run_id, task_id, action_idx, kind, int(at_sec), reason, supersedes,
              item_id, copy_id,
-             json.dumps(sorted(set(dresser_ids)), ensure_ascii=False) if dresser_ids else None,
+             json.dumps(sorted(set(dresser_ids)), ensure_ascii=False)
+             if dresser_ids is not None else None,
              time.time()))
         con.commit()
         return cur.lastrowid

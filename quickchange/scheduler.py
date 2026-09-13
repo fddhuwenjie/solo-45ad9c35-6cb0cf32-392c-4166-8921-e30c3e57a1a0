@@ -243,6 +243,53 @@ def action_side(t, a, state):
     return pos["side"] if pos else t["exit_side"]
 
 
+def staff_affected_keys(state, did, old_skills, new_skills, old_sides, new_sides):
+    """服装师资料变化后，该服装师实际受影响的动作键集合。
+
+    只返回其参与、且因技能/侧台变化导致「资格状态翻转」的动作
+    （合格→不合格，或反之）。未登记侧台=两侧均可，与排程判定一致。
+    """
+    maps = _staffing_maps(state)
+    tasks = {t["id"]: t for t in state["tasks"]}
+    affected = []
+    for t in state["tasks"]:
+        acts, _ = build_actions(t, state)
+        for a in acts:
+            staff = resolve_staffing(state, t, a, maps)
+            if did not in staff["ids"]:
+                continue
+            side = action_side(t, a, state)
+            sk = staff["required_skill"]
+
+            def ok(skills, sides):
+                if sk and sk not in skills:
+                    return False
+                if sides and side not in sides:
+                    return False
+                return True
+
+            before, after = ok(old_skills, old_sides), ok(new_skills, new_sides)
+            if before != after:
+                affected.append((t["id"], a["kind"], a.get("item_id"),
+                                 a.get("seq", 0), not after))
+    return affected
+
+
+def staff_unavailable_keys(state, did, u0, u1):
+    """该服装师计划动作中，与不可用时段 [u0,u1) 相交的动作键。"""
+    maps = _staffing_maps(state)
+    sched = compute_schedule(state)
+    by_key = {(a["task_id"], a["kind"], a.get("item_id"), a.get("seq", 0)): a
+              for a in sched["actions"]}
+    out = []
+    for (tid, kind, item_id, seq), a in by_key.items():
+        if did not in (a.get("staff", {}) or {}).get("ids", []):
+            continue
+        if a["start"] < u1 and a["end"] > u0:
+            out.append((tid, kind, item_id, seq))
+    return out
+
+
 def point_of_action(t, a, state, positions):
     """动作发生点（米）：换装动作在换装位；walk=1 从换装位走向上场口，
     取上场口；fetch 往返取换装位。"""
@@ -252,12 +299,30 @@ def point_of_action(t, a, state, positions):
     return (pos["x"], pos["y"]) if pos else EXITS.get(t["exit_side"], EXITS["L"])
 
 
-def dresser_ready(dr_id, start, dur, action_pt, busy, unavail, maps, limit=40):
+def transfer_walk(from_pt, from_side, to_pt, to_side):
+    """相邻动作间的服装师步行耗时（秒）。
+
+    同侧：换装位间直线快走；跨侧台：必须绕后场、经上场口过渡，不能穿台——
+    换装位→本侧口 + 两侧口间跨越 + 另一侧口→换装位。总路程一次取整，
+    两侧口之间正好 36m/WALK_SPEED=28s，跨侧总步行恒 ≥28s。
+    """
+    def dist(a, b):
+        return math.hypot(a[0] - b[0], a[1] - b[1])
+    if from_side == to_side:
+        return walk_sec(from_pt, to_pt)
+    total = (dist(from_pt, EXITS[from_side])
+             + dist(EXITS["L"], EXITS["R"])
+             + dist(EXITS[to_side], to_pt))
+    return max(1, math.ceil(total / WALK_SPEED))
+
+
+def dresser_ready(dr_id, start, dur, action_pt, action_side_, busy, unavail,
+                  maps, limit=40):
     """服装师从 start 起最早可执行 [?, ?+dur) 的时刻。
 
-    busy: 该服装师已提交区间 [(s,e,label,end_point),...]；
+    busy: 该服装师已提交区间 [(s,e,label,end_point,key,side),...]；
     unavail: 不可用时段 [(u0,u1),...]；
-    衔接上一动作需从其结束点步行到本动作点（跨侧台按上场口间距离）。
+    衔接上一动作：同侧直线快走，跨侧台绕上场口（计入 28s 跨越）。
     返回 (ready, blocker|None, prev_end)。
     """
     cur = start
@@ -265,16 +330,33 @@ def dresser_ready(dr_id, start, dur, action_pt, busy, unavail, maps, limit=40):
     prev_end = None
     for _ in range(limit):
         pushed = False
+        # 已提交动作：只要「上一动作结束 + 到本动作点的步行」晚于 cur，
+        # 就必须等（时间区间不相交也要计入跨侧台/远距离步行）。
+        nxt_iv = None
         for iv in busy:
             s, e = iv[0], iv[1]
-            if s < cur + dur and e > cur:
+            if e <= cur:
                 end_pt = iv[3] if len(iv) > 3 and iv[3] else None
-                walk = walk_sec(end_pt, action_pt) if end_pt else 0
-                nxt = e + walk
-                if nxt > cur:
-                    cur, blocker, prev_end = nxt, iv, e
-                    pushed = True
-                    break
+                end_side = iv[5] if len(iv) > 5 and iv[5] else action_side_
+                walk = transfer_walk(end_pt, end_side, action_pt, action_side_) \
+                    if end_pt else 0
+                arrive = e + walk
+                if arrive > cur and (nxt_iv is None or arrive > nxt_iv[0]):
+                    nxt_iv = (arrive, iv)
+                continue
+            if s < cur + dur and e > cur:
+                # 时间相交
+                end_pt = iv[3] if len(iv) > 3 and iv[3] else None
+                end_side = iv[5] if len(iv) > 5 and iv[5] else action_side_
+                walk = transfer_walk(end_pt, end_side, action_pt, action_side_) \
+                    if end_pt else 0
+                arrive = e + walk
+                if arrive > cur and (nxt_iv is None or arrive > nxt_iv[0]):
+                    nxt_iv = (arrive, iv)
+        if nxt_iv:
+            arrive, iv = nxt_iv
+            cur, blocker, prev_end = arrive, iv, iv[1]
+            pushed = True
         if pushed:
             continue
         for u0, u1 in unavail:
@@ -640,12 +722,13 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
                     static_ok = False
 
                 apt = point_of_action(t, a, state, positions)
+                aside = action_side(t, a, state)
                 # 每位参与者：动作级占用 / 不可用时段 / 跨侧台步行 → 集体到岗时刻
                 action_shift = 0
                 arrival_info = None
                 for did in staff["ids"]:
                     ready, blocker, prev_end = dresser_ready(
-                        did, cur, a["dur"], apt, dresser_busy[did],
+                        did, cur, a["dur"], apt, aside, dresser_busy[did],
                         unavail.get(did, []), maps)
                     if ready > cur:
                         if ready - cur > action_shift:
@@ -660,14 +743,18 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
                     elif blocker:
                         bt = tasks_by_id.get(blocker[2])
                         blabel = f"任务#{blocker[2]}"
+                        cross = False
                         if bt:
                             bkey = blocker[4] if len(blocker) > 4 else None
+                            bside = blocker[5] if len(blocker) > 5 else None
                             ba = next((x for x in bt["_acts"] if action_key(x) == bkey), None)
                             if ba:
                                 blabel = f"「{ba['label']}」"
+                            cross = bside is not None and bside != aside
                         walk_n = ready - prev_end
-                        cross = f"，跨侧台步行 {walk_n}s" if walk_n else ""
-                        msg = (f"到岗过晚：{dname} 在 {fmt(prev_end)} 才结束{blabel}{cross}，"
+                        why = f"，跨侧台步行 {walk_n}s" if cross else (
+                            f"，步行 {walk_n}s" if walk_n else "")
+                        msg = (f"到岗过晚：{dname} 在 {fmt(prev_end)} 才结束{blabel}{why}，"
                                f"{a['label']} 最早 {fmt(ready)} 开始")
                     else:
                         msg = f"到岗过晚：{dname} 最早 {fmt(ready)} 到岗"
@@ -685,22 +772,51 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
             start, end = laid[0]["start"], laid[-1]["end"]
             occ_s, occ_e = laid[0]["end"], laid[-1]["start"]
             if t["locked"]:
-                # 锁定任务不移动：与其它占用的重叠只记录为冲突
+                # 锁定任务不移动：演员重叠、每位参与者的到岗（含跨侧台步行）
+                # 与不可用时段都记录为冲突
                 blk = _overlap(actor_busy[aid], start, end)
                 if blk:
                     staff_arrival_notes.append({"type": "actor", "task_id": tid,
                         "action_idx": 0, "time": start,
                         "message": f"锁定任务与任务#{blk[2]}的演员时间重叠"})
                 for a in laid:
+                    apt = a["point"]
+                    aside = action_side(t, a, state)
                     for did in a["staff"]["ids"]:
-                        blk = _overlap2(dresser_busy[did], start, end)
-                        if blk:
-                            dn = dressers[did]["name"] if did in dressers else f"#{did}"
-                            staff_arrival_notes.append({
-                                "type": "arrival", "task_id": tid,
-                                "action_idx": a["action_idx"],
-                                "time": start,
-                                "message": f"锁定任务：{dn} 与任务#{blk[2]}的动作时间重叠"})
+                        # 只与「其它任务」已提交占用比较，排除本任务自身
+                        other = [iv for iv in dresser_busy[did] if iv[2] != tid]
+                        ready, blocker, prev_end = dresser_ready(
+                            did, a["start"], a["dur"], apt, aside,
+                            other, unavail.get(did, []), maps)
+                        if ready <= a["start"]:
+                            continue
+                        dname = dressers[did]["name"] if did in dressers else f"#{did}"
+                        if blocker and blocker[0] == "unavail":
+                            m = (f"到岗过晚：{dname} 处于不可用时段至 {fmt(prev_end)}，"
+                                 f"{a['label']} 最早 {fmt(ready)} 开始")
+                        elif blocker:
+                            bt = tasks_by_id.get(blocker[2])
+                            blabel = f"任务#{blocker[2]}"
+                            cross = False
+                            if bt:
+                                bkey = blocker[4] if len(blocker) > 4 else None
+                                bside = blocker[5] if len(blocker) > 5 else None
+                                ba = next((x for x in bt["_acts"]
+                                           if action_key(x) == bkey), None)
+                                if ba:
+                                    blabel = f"「{ba['label']}」"
+                                cross = bside is not None and bside != aside
+                            wn = ready - prev_end
+                            why = f"，跨侧台步行 {wn}s" if cross else (
+                                f"，步行 {wn}s" if wn else "")
+                            m = (f"到岗过晚：{dname} 在 {fmt(prev_end)} 才结束{blabel}{why}，"
+                                 f"{a['label']} 最早 {fmt(ready)} 开始")
+                        else:
+                            m = f"到岗过晚：{dname} 最早 {fmt(ready)} 到岗"
+                        staff_arrival_notes.append({
+                            "type": "arrival", "task_id": tid,
+                            "action_idx": a["action_idx"], "time": ready,
+                            "action_label": a["label"], "message": m})
                 break
             blk = _overlap(actor_busy[aid], start, end)
             if blk:
@@ -737,7 +853,8 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
             # 服装师动作级日历（区间结束点用于下一动作的步行衔接）
             for did in a["staff"]["ids"]:
                 dresser_busy[did].append(
-                    (a["start"], a["end"], tid, a["point"], action_key(a)))
+                    (a["start"], a["end"], tid, a["point"], action_key(a),
+                     action_side(t, a, state)))
             if iid is None:
                 continue
             if a["kind"] == "don":
@@ -786,8 +903,13 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
                               "time": start, "message": "关联场次/道具有变更，待复核"})
         conflicts.extend(action_review_notes)
         if t["locked"]:
-            # 锁定任务不移动：报本轮实际检测到的重叠
-            conflicts.extend(staff_arrival_notes)
+            # 锁定任务不移动：报本轮实际检测到的重叠（同动作多条去重）
+            seen_msg = set()
+            for n in staff_arrival_notes:
+                k = (n.get("action_idx"), n["message"])
+                if k not in seen_msg:
+                    seen_msg.add(k)
+                    conflicts.append(n)
         else:
             # 可移动任务：报首次受阻根因（最终布局已顺延时当前轮无冲突）
             conflicts.extend(root_staff_notes)
