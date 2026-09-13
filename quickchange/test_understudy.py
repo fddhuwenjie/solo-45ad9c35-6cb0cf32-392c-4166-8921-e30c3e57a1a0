@@ -429,6 +429,86 @@ def test_drag_cast_and_assign_endpoints():
     os.unlink(tmp)
 
 
+def test_branch_based_on_revision_ignores_new_tasks():
+    """旧修订之后当前方案新增的任务不得混入分支：
+    - build_branch 忽略 cast 中快照外的任务（ignored_cast），不抛 KeyError；
+    - /cast 接口对快照外任务返回 400，不 500；
+    - 计划含独立 orig_windows/base_tasks/base_scenes，差异 SVG 用两套窗口。"""
+    fd, tmp = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    db.DB_PATH = tmp
+    db.init_db()
+    import app as web
+    client = web.app.test_client()
+    con = db.connect()
+    _seed_basic_db(con)
+    db.sync_item_copies(1)
+    con.close()
+    client.post("/api/actors/2/measures",
+                json={"height": 175, "chest": 95, "waist": 80, "hip": 95,
+                      "shoulder": 42, "foot": 26})
+    rev_id = client.post("/api/revisions", json={"note": "旧修订"}).get_json()[
+        "revisions"][0]["id"]
+    # 修订之后新增任务 99（当前方案任务集）
+    r = client.post("/api/tasks", json={
+        "actor_id": 1, "from_scene_id": 1, "to_scene_id": 2,
+        "exit_side": "L", "position_id": None, "dresser_id": 1})
+    assert r.status_code == 200
+
+    # 1) 直接引擎：state 含新任务，快照只有任务1；cast 引用 99 被忽略
+    rev = db.get_revision(rev_id)
+    cur = db.load_state(1)
+    base = understudy.base_state_for(cur, rev)
+    assert {t["id"] for t in base["tasks"]} == {1}
+    p = understudy.build_branch(base, {1: 2, 99: 2})
+    assert 99 in p["ignored_cast"], f"新任务应被忽略：{p['ignored_cast']}"
+    assert "99" not in p["cast"] and 99 not in p["swapped"]
+    # 两套窗口与基准快照
+    assert "1" in p["orig_windows"] and "1" in p["windows"]
+    assert {t["id"] for t in p["base_tasks"]} == {1}
+    assert {s["id"] for s in p["base_scenes"]} == {1, 2}
+
+    # 2) 创建分支引用新任务不 500（忽略）
+    r = client.post("/api/understudy/branches",
+                    json={"revision_id": rev_id, "name": "b", "cast": {"1": 2, "99": 2}})
+    assert r.status_code == 200, r.data
+    bid = r.get_json()["id"]
+    assert 99 in r.get_json()["detail"]["plan"]["ignored_cast"]
+
+    # 3) /cast 对快照外任务返回 400
+    r = client.post(f"/api/understudy/branches/{bid}/cast",
+                    json={"task_id": 99, "actor_id": 2})
+    assert r.status_code == 400, f"快照外任务换角应 400，实得 {r.status_code}"
+    # 快照内任务正常
+    r = client.post(f"/api/understudy/branches/{bid}/cast",
+                    json={"task_id": 1, "actor_id": 2})
+    assert r.status_code == 200
+
+    # 4) 差异 SVG 使用分支冻结的两套窗口：上排原计划/下排替演都出现
+    svg = client.get(f"/export/understudy/{bid}/diff.svg").data.decode()
+    assert "#1原" in svg and "#1替" in svg, "差异 SVG 应叠放原计划与替演两层"
+    # 新任务不得出现在旧修订分支的 SVG
+    assert "#99" not in svg
+    os.unlink(tmp)
+
+
+def test_orig_windows_reflect_plan_before_swap():
+    """orig_windows 是未换角的原计划：换角导致替演窗口变化时两者起止不同。"""
+    # 候补尺寸更大导致穿上更慢（偏差加时），替演窗口应晚于原计划
+    st = make_state(measures=[M1, {**M2_BIG, "chest": 107, "waist": 90,
+                                   "hip": 107, "shoulder": 46}], copies=2)
+    p = understudy.build_branch(st, {1: 2}, notes={"1:1": "候补偏大，试穿通过"})
+    w0, w1 = p["orig_windows"]["1"], p["windows"]["1"]
+    don_orig = next(a for a in p["orig_actions"] if a["kind"] == "don")
+    don_new = next(a for a in p["actions"]
+                   if a["task_id"] == 1 and a["kind"] == "don")
+    assert don_new["dur"] > don_orig["dur"], "换角后穿脱时长应反映尺寸偏差"
+    assert w1["start"] >= w0["start"]
+    # 原计划不随 cast 变化：同基准、不同 cast 的 orig_windows 一致
+    p2 = understudy.build_branch(st, {})
+    assert p2["orig_windows"]["1"] == p["orig_windows"]["1"]
+
+
 if __name__ == "__main__":
     print("替演推演测试：")
     check("候补沿用原角造型（个人造型忽略）+偏差加时", test_inherit_original_look_and_penalties)
@@ -442,4 +522,6 @@ if __name__ == "__main__":
     check("API：登记→开分支→确认冻结→尺寸变化待复核→导出", test_api_flow_freeze_review_export)
     check("有硬冲突时禁止确认（409）", test_confirm_blocked_with_conflict)
     check("拖换卡司/还原/改派备注接口", test_drag_cast_and_assign_endpoints)
+    check("旧修订后新增任务不混入分支；两套窗口；差异SVG", test_branch_based_on_revision_ignores_new_tasks)
+    check("orig_windows 为换角前原计划且不随卡司变化", test_orig_windows_reflect_plan_before_swap)
     print(f"全部通过（{len(PASS)} 项）")

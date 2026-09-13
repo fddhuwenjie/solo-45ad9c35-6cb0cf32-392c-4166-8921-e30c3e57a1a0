@@ -1148,13 +1148,18 @@ function renderBranch() {
 
 function renderCast(d, frozen) {
   const p = d.plan;
-  // 基准修订快照任务：用 plan.windows 的 id 与当前 S.tasks 合并取信息
-  const tasks = S.tasks;
-  const scenes = S.scenes;
+  // 一律以分支基准修订快照的任务/场次为准（当前方案新增任务不混入）
+  const tasks = p.base_tasks || S.tasks;
+  const scenes = p.base_scenes || S.scenes;
   const cast = p.cast || {};
   const box = $("#ub-cast");
-  const sorted = tasks.slice().sort((a, b) =>
-    ((p.windows[a.id] || {}).start || 0) - ((p.windows[b.id] || {}).start || 0));
+  const sorted = tasks.slice().sort((a, b) => {
+    const wa = (p.orig_windows || p.windows)[a.id] ||
+               (p.orig_windows || p.windows)[String(a.id)] || {};
+    const wb = (p.orig_windows || p.windows)[b.id] ||
+               (p.orig_windows || p.windows)[String(b.id)] || {};
+    return (wa.start || 0) - (wb.start || 0);
+  });
   box.innerHTML = sorted.map((t) => {
     const fs = scenes.find((s) => s.id === t.from_scene_id);
     const ts = scenes.find((s) => s.id === t.to_scene_id);
@@ -1180,12 +1185,16 @@ function renderCast(d, frozen) {
   }).join("");
   box.querySelectorAll("select").forEach((s) => {
     s.onchange = async () => {
-      const tid = s.dataset.task;
+      const tid = +s.dataset.task;
       const aid = +s.value;
-      const origTask = tasks.find((t) => t.id === +tid);
+      const origTask = tasks.find((t) => t.id === tid);
       const actorId = aid === origTask.actor_id ? 0 : aid;
-      await ubApi(`/api/understudy/branches/${UB.branchId}/cast`, "POST",
-        { task_id: +tid, actor_id: actorId });
+      const j = await ubApi(`/api/understudy/branches/${UB.branchId}/cast`, "POST",
+        { task_id: tid, actor_id: actorId });
+      if (j && j.detail && j.detail.plan && j.detail.plan.ignored_cast &&
+          j.detail.plan.ignored_cast.length) {
+        alert("部分任务不在该修订中，已忽略：" + j.detail.plan.ignored_cast.join(","));
+      }
       await loadBranch(UB.branchId);
     };
   });
@@ -1280,11 +1289,15 @@ function renderUbSvg(d) {
   const p = d.plan;
   const svg = $("#ub-svg");
   const W = 1180, L = 60, R = 30, top = 34, laneH = 52;
-  const scenes = S.scenes;
-  const tasks = S.tasks;
+  // 两层窗口的场次/任务都来自分支冻结的基准修订快照
+  const scenes = p.base_scenes || S.scenes;
+  const tasks = p.base_tasks || S.tasks;
+  const origW = p.orig_windows || p.windows;   // 原计划窗口
+  const newW = p.windows;                       // 替演重排窗口
   const total = Math.max(...scenes.map((s) => s.start_sec + s.duration_sec), 600) + 60;
   const x = (t) => L + (W - L - R) * t / total;
   const cast = p.cast || {};
+  const castIds = new Set(Object.keys(cast).map(Number));
   const actorIds = new Set();
   tasks.forEach((t) => {
     actorIds.add(t.actor_id);
@@ -1304,37 +1317,39 @@ function renderUbSvg(d) {
     g += `<text x="2" y="${y + 24}" font-size="12">${esc(a.name)}</text>`;
     g += el("line", { x1: L, y1: y + laneH - 2, x2: W - R, y2: y + laneH - 2, stroke: "#eee" });
   });
-  // 原计划条（灰，上排）：基于基准快照排程结果不可得，用 plan.actions 里未替任务
-  // 简化：所有任务用 windows；替演任务上排画「原角」起点（灰）、下排画替演
+  // 原计划条（灰，上排）：所有快照任务按原角泳道，取 orig_windows
   tasks.forEach((t) => {
     const i = actors.findIndex((a) => a.id === t.actor_id);
     if (i < 0) return;
     const y = top + i * laneH;
-    const w = p.windows[t.id];
-    const isSwap = cast[t.id];
+    const w = origW[t.id] || origW[String(t.id)];
     if (w) {
-      const color = isSwap ? "#95a5a6" : (!w.ok ? "#c0392b" : "#7f8c8d");
+      const color = castIds.has(t.id) ? "#7f8c8d" : (!w.ok ? "#c0392b" : "#95a5a6");
       g += ubBar(x, y + 4, w, color, `#${t.id}原`);
     }
   });
+  // 替演重排条（紫/红，下排）：只画被换角任务，取 windows
   Object.entries(cast).forEach(([tid, aid]) => {
     const i = actors.findIndex((a) => a.id === +aid);
     if (i < 0) return;
-    const w = p.windows[tid];
+    const w = newW[tid];
     if (!w) return;
     const y = top + i * laneH;
     g += ubBar(x, y + 21, w, w.ok ? "#8e44ad" : "#c0392b", `#${tid}替`);
   });
   // 冲突三角（定位最早）
   p.conflicts.forEach((c, i) => {
-    const aid = cast[c.task_id] ? +cast[c.task_id] :
-      (tasks.find((t) => t.id === c.task_id) || {}).actor_id;
+    let aid = cast[c.task_id] ? +cast[c.task_id] : null;
+    if (aid == null) {
+      const t = tasks.find((z) => z.id === c.task_id);
+      aid = t ? t.actor_id : null;
+    }
     const i2 = actors.findIndex((a) => a.id === aid);
     if (i2 < 0) return;
     const cx = x(c.time), cy = top + i2 * laneH + laneH - 4;
     const col = i === 0 ? "#e67e22" : "#e74c3c";
-    g += `<path d="M${cx},${cy} l5,-8 l5,8 z" fill="${col}"/>` +
-      `<title>${esc(c.message)}</title>`;
+    g += `<path d="M${cx},${cy} l5,-8 l5,8 z" fill="${col}">` +
+      `<title>[${fmt(c.time)}] ${esc(c.message)}</title></path>`;
   });
   const ly = h - 18;
   g += `<rect x="${L}" y="${ly - 10}" width="12" height="12" fill="#7f8c8d"/><text x="${L + 16}" y="${ly}">原计划</text>` +
@@ -1344,7 +1359,6 @@ function renderUbSvg(d) {
 }
 
 function ubBar(x, y, w, color, label) {
-  const W = 1180;
   const bx = x(w.start), bw = Math.max(4, x(w.end) - x(w.start));
   let s = el("rect", { x: bx, y, width: bw, height: 13, rx: 2, fill: color, opacity: 0.92 });
   s += `<text x="${bx + 2}" y="${y + 10}" fill="#fff" font-size="9">${esc(label)}</text>`;
@@ -1352,7 +1366,6 @@ function ubBar(x, y, w, color, label) {
     stroke: "#c0392b", "stroke-dasharray": "3 2" });
   return s;
 }
-
 
 
 function renderAll() {

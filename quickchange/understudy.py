@@ -255,6 +255,7 @@ def build_branch(state, cast, assigns=None, notes=None, alter_start_sec=0):
     base = _copy.deepcopy(state)
     base.pop("_duration_ov", None)
     base.pop("_pin_copy", None)
+    base.pop("_init_pins", None)
     dur_ov, pin_copy = {}, {}
     decisions, hard, fit_rows_out = [], [], []
 
@@ -262,8 +263,22 @@ def build_branch(state, cast, assigns=None, notes=None, alter_start_sec=0):
         hard.append({"time": int(t), "task_id": tid, "action_idx": action_idx,
                      "type": kind, "message": msg})
 
-    # 1) 拖换卡司：保留换装位/分工/出入口，记录原角
-    cast = {int(k): int(v) for k, v in cast.items() if int(v)}
+    # 0) 原计划窗口：基准修订快照、未换角、无替演钩子的排程结果。
+    #    与替演重排使用两套独立窗口，供页面/差异 SVG 叠放真实起止差异。
+    orig_state = _copy.deepcopy(state)
+    for k in ("_duration_ov", "_pin_copy", "_init_pins"):
+        orig_state.pop(k, None)
+    orig_sched = scheduler.compute_schedule(orig_state)
+    orig_windows = {str(tid): w for tid, w in orig_sched["windows"].items()}
+    orig_actions = [_slim_action(a) for a in orig_sched["actions"]]
+
+    # 1) 拖换卡司：保留换装位/分工/出入口，记录原角。
+    #    卡司只接受**基准修订快照内**的任务；当前方案在该修订之后新增的任务
+    #    不得混入旧分支（否则原角色查找会 KeyError）。忽略项回传前端。
+    snap_task_ids = {t["id"] for t in base["tasks"]}
+    raw_cast = {int(k): int(v) for k, v in cast.items() if int(v)}
+    cast = {tid: aid for tid, aid in raw_cast.items() if tid in snap_task_ids}
+    ignored_cast = sorted(set(raw_cast) - set(cast))
     swapped = set(cast)
     orig_of = {t["id"]: t["actor_id"] for t in base["tasks"] if t["id"] in swapped}
     for t in base["tasks"]:
@@ -311,15 +326,17 @@ def build_branch(state, cast, assigns=None, notes=None, alter_start_sec=0):
     base["looks"] = [l for l in base["looks"] if l["id"] not in dropped_under_look_ids]
 
     # 被完全替掉的「原角×场次」：只有拖换任务**进入**（to_scene）的场次才
-    # 顶替原角；若仍有未拖换任务让该原角在该场登台则保留。任务离开的场次
-    # （from_scene）不顶替——候补本就可能在相邻场次以自己的角色登台。
+    # 顶替原角；若快照内仍有未拖换任务让该原角在该场登台则保留。任务离开的
+    # 场次（from_scene）不顶替——候补本就可能在相邻场次以自己的角色登台。
+    # 一律以**快照任务**（base）为准，不读当前方案新增的任务。
+    snap_tasks_by_id = _index(base["tasks"])
     pre_clone_look_ids = {l["id"] for l in state["looks"]}
     replaced = defaultdict(set)
     for tid in swapped:
         rid = orig_of[tid]
-        ot = next(t for t in state["tasks"] if t["id"] == tid)
+        ot = snap_tasks_by_id[tid]
         replaced[rid].add(ot["to_scene_id"])
-    for t in state["tasks"]:
+    for t in base["tasks"]:
         if t["id"] in swapped:
             continue
         replaced.get(t["actor_id"], set()).discard(t["from_scene_id"])
@@ -624,11 +641,17 @@ def build_branch(state, cast, assigns=None, notes=None, alter_start_sec=0):
     swapped_copies = _slim_copies(sched["copies"], swapped)
     return {
         "cast": {str(k): v for k, v in cast.items()},
+        "ignored_cast": ignored_cast,
         "assigns": assigns,
         "notes": notes,
         "alter_start_sec": int(alter_start_sec or 0),
         "actions": [_slim_action(a) for a in sched["actions"]],
         "windows": {str(tid): w for tid, w in sched["windows"].items()},
+        "orig_windows": orig_windows,
+        "orig_actions": orig_actions,
+        # 基准修订快照的任务/场次（前端绘制与差异 SVG 都以此为准，不读当前方案）
+        "base_tasks": _copy.deepcopy(state["tasks"]),
+        "base_scenes": _copy.deepcopy(state["scenes"]),
         "conflicts": hard,
         "decisions": decisions,
         "copies": swapped_copies,

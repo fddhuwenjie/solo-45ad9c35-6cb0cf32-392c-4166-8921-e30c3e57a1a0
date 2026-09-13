@@ -722,6 +722,17 @@ def api_branch_cast(bid):
     except (KeyError, TypeError, ValueError):
         return jsonify({"ok": False, "error": "task_id/actor_id 无效"}), 400
     cast, assigns, notes, alter_start = _branch_inputs(br)
+    # 任务必须属于基准修订快照：当前方案在该修订之后新增的任务不能换角
+    base = _branch_base(br)
+    if base is None:
+        return jsonify({"ok": False, "error": "基准修订不存在"}), 400
+    snap_ids = {str(t["id"]) for t in base["tasks"]}
+    if tid not in snap_ids:
+        return jsonify({"ok": False,
+                        "error": f"任务#{tid}不在基准修订中（可能是修订后新增），"
+                                 "不能在该分支换角"}), 400
+    if aid and aid not in {a["id"] for a in base["actors"]}:
+        return jsonify({"ok": False, "error": "候补演员不存在"}), 400
     if aid:
         cast[tid] = aid
     else:
@@ -752,6 +763,10 @@ def api_branch_assign(bid):
         return jsonify({"ok": False, "error": "task_id/item_id/copy_id 无效"}), 400
     note = (data.get("note") or "").strip()
     cast, assigns, notes, alter_start = _branch_inputs(br)
+    base = _branch_base(br)
+    if str(tid) not in {str(t["id"]) for t in base["tasks"]}:
+        return jsonify({"ok": False,
+                        "error": f"任务#{tid}不在基准修订中，不能改派副本"}), 400
     con = db.connect()
     try:
         row = con.execute("SELECT id FROM item_copies WHERE id=? AND item_id=?",
@@ -783,6 +798,9 @@ def api_branch_note(bid):
     data = request.get_json(force=True)
     key = f"{int(data['task_id'])}:{int(data['item_id'])}"
     cast, assigns, notes, alter_start = _branch_inputs(br)
+    base = _branch_base(br)
+    if not str(key.split(":")[0]) in {str(t["id"]) for t in base["tasks"]}:
+        return jsonify({"ok": False, "error": "任务不在基准修订中，不能登记备注"}), 400
     note = (data.get("note") or "").strip()
     if note:
         notes[key] = note
@@ -1078,17 +1096,16 @@ h1{{font-size:19px}}h2{{font-size:15px;margin-top:18px}}.sub{{color:#888;font-si
 
 
 def _understudy_diff_svg(br, plan, state, dl=False):
-    """原计划 vs 替演 叠放 SVG：受影响演员泳道内上原下替，标出冲突与截止。"""
-    import json as _json
-    rev = db.get_revision(br["revision_id"])
-    snap = _json.loads(rev["snapshot"])
-    orig_state = understudy.base_state_for(state, rev)
-    orig_sched = scheduler.compute_schedule(orig_state)
-    scenes = state["scenes"]
+    """原计划 vs 替演 叠放 SVG。两层窗口分别取分支冻结的 orig_windows 与
+    windows（同一基准修订的场次/任务），真实反映换角前后的起止差异；不读当前
+    方案坐标，也不重新计算原计划。"""
+    scenes = plan.get("base_scenes") or state["scenes"]
+    base_tasks = plan.get("base_tasks") or []
+    orig_windows = plan.get("orig_windows") or {}
     cast = {int(k): v for k, v in plan["cast"].items()}
-    orig_tasks = {t["id"]: t for t in snap["tasks"]}
-    actor_ids = sorted({cast[tid] for tid in cast} |
-                       {orig_tasks[tid]["actor_id"] for tid in cast if tid in orig_tasks})
+    orig_task = {t["id"]: t for t in base_tasks}
+    actor_ids = sorted({cast[tid] for tid in cast if tid in orig_task} |
+                       {orig_task[tid]["actor_id"] for tid in cast if tid in orig_task})
     actors = {a["id"]: a for a in state["actors"]}
     total = max((s["start_sec"] + s["duration_sec"] for s in scenes), default=600) + 60
     scale = 900.0 / max(total, 1)
@@ -1104,44 +1121,57 @@ def _understudy_diff_svg(br, plan, state, dl=False):
         parts.append(f'<text x="{x+2:.1f}" y="19" fill="#334">{_xml(s["name"])}</text>')
     for i, aid in enumerate(actor_ids):
         y = top + i * lane_h
-        parts.append(f'<text x="2" y="{y+26}">{_xml(actors.get(aid, {}).get("name", "#"+str(aid)))}</text>')
+        parts.append(f'<text x="2" y="{y+26}">'
+                     f'{_xml(actors.get(aid, {}).get("name", "#"+str(aid)))}</text>')
         parts.append(f'<line x1="40" y1="{y+lane_h}" x2="950" y2="{y+lane_h}" stroke="#eee"/>')
 
     def bar(tid, w, y, color, label):
-        x = 40 + w["start"] * scale
+        bx = 40 + w["start"] * scale
         wdt = max(3, (w["end"] - w["start"]) * scale)
-        parts.append(f'<rect x="{x:.1f}" y="{y}" width="{wdt:.1f}" height="13" rx="2" '
+        parts.append(f'<rect x="{bx:.1f}" y="{y}" width="{wdt:.1f}" height="13" rx="2" '
                      f'fill="{color}" opacity="0.9"/>')
-        parts.append(f'<text x="{x+2:.1f}" y="{y+10}" fill="#fff" font-size="9">'
+        parts.append(f'<text x="{bx+2:.1f}" y="{y+10}" fill="#fff" font-size="9">'
                      f'#{tid}{label}</text>')
         dx = 40 + w["deadline"] * scale
         parts.append(f'<line x1="{dx:.1f}" y1="{y-2}" x2="{dx:.1f}" y2="{y+17}" '
                      f'stroke="#c0392b" stroke-dasharray="3 2"/>')
 
+    # 上排：原计划（orig_windows）；下排：替演重排（windows），同一演员泳道
     for i, aid in enumerate(actor_ids):
         y = top + i * lane_h
-        # 原计划：该演员（原角）的任务在上排
-        for tid, ot in orig_tasks.items():
-            if ot["actor_id"] != aid:
+        for tid, ot in orig_task.items():
+            if ot["actor_id"] != aid or str(tid) in {str(k) for k in cast}:
                 continue
-            w = orig_sched["windows"].get(tid)
+            w = orig_windows.get(str(tid))
             if w:
-                bar(tid, w, y + 4, "#7f8c8d", "原")
-        # 替演：候补承担的任务在下排
+                bar(tid, w, y + 4, "#95a5a6", "原")
+        # 被换角任务：先画上排原角的原计划窗口
         for tid, ua in cast.items():
-            if ua != aid:
+            ot = orig_task.get(tid)
+            if not ot:
                 continue
-            w = plan["windows"].get(str(tid))
-            if w:
-                color = "#c0392b" if not w["ok"] else "#8e44ad"
-                bar(tid, w, y + 21, color, "替")
-    for c in plan["conflicts"]:
-        aid = cast.get(c["task_id"], 0)
+            if ot["actor_id"] == aid:
+                w = orig_windows.get(str(tid))
+                if w:
+                    bar(tid, w, y + 4, "#7f8c8d", "原")
+            if ua == aid:
+                w = plan["windows"].get(str(tid))
+                if w:
+                    color = "#c0392b" if not w["ok"] else "#8e44ad"
+                    bar(tid, w, y + 21, color, "替")
+    # 冲突三角：橙色为最早，其余红色
+    for i, c in enumerate(plan["conflicts"]):
+        aid = cast.get(c["task_id"])
+        if aid is None or aid not in actor_ids:
+            ot = orig_task.get(c["task_id"])
+            aid = ot["actor_id"] if ot else None
         if aid not in actor_ids:
             continue
         y = top + actor_ids.index(aid) * lane_h
-        x = 40 + c["time"] * scale
-        parts.append(f'<path d="M{x:.1f},{y+40} l4,-6 l4,6 z" fill="#e74c3c"/>')
+        cx = 40 + c["time"] * scale
+        parts.append(f'<path d="M{cx:.1f},{y+40} l4,-6 l4,6 z" '
+                     f'fill={"#e67e22" if i == 0 else "#e74c3c"}">'
+                     f'<title>{_xml(c["message"])}</title></path>')
     ly = h - 28
     parts.append(f'<rect x="40" y="{ly}" width="12" height="12" fill="#7f8c8d"/>'
                  f'<text x="56" y="{ly+10}">原计划</text>'
@@ -1149,8 +1179,8 @@ def _understudy_diff_svg(br, plan, state, dl=False):
                  f'<text x="126" y="{ly+10}">替演(按时)</text>'
                  f'<rect x="200" y="{ly}" width="12" height="12" fill="#c0392b"/>'
                  f'<text x="216" y="{ly+10}">替演(超时)</text>'
-                 f'<path d="M300,{ly+12} l4,-7 l4,7 z" fill="#e74c3c"/>'
-                 f'<text x="312" y="{ly+10}">冲突</text>')
+                 f'<path d="M300,{ly+2} l4,-7 l4,7 z" fill="#e67e22"/>'
+                 f'<text x="312" y="{ly+10}">最早冲突</text>')
     parts.append(f'<text x="40" y="{h-8}" fill="#888" font-size="10">'
                  f'{_xml(br["name"])} · 基准修订#{br["revision_id"]}</text>')
     parts.append("</svg>")
