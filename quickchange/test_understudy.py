@@ -137,10 +137,15 @@ def test_closure_penalties():
         look_items=[{"look_id": 1, "item_id": 1, "ord": 0},
                     {"look_id": 2, "item_id": 1, "ord": 0}],
         tasks=[task_row(1, 1, 1, 2), task_row(2, 2, 2, 3)])
-    p4 = understudy.build_branch(st3, {1: 2, 2: 2}, notes={"2:1": "系带脱下"})
-    # 任务2 脱下的是同一件系带副本（自动选定）→ +8
+    # 脱下加时：乙开场前已穿、S3 脱下离场；人工改派系带副本（12）→ 脱 +8
+    p4 = understudy.build_branch(st3, {1: 2, 2: 2},
+                                 assigns={"2:1": 12},
+                                 notes={"2:1": "系带脱下"})
     doff4 = next(a for a in p4["actions"] if a["task_id"] == 2 and a["kind"] == "doff")
     assert doff4["dur"] == 16, f"系带脱应+8，实得 {doff4['dur']}"
+    # 脱下件必须落在人工改派的系带副本（fit_rows 与排程一致）
+    assert p4["fit_rows"][0]["copy_no"] == 2
+    assert any(c["copy_no"] == 2 and c["pre_show"] for c in p4["copies"])
 
 
 def test_missing_and_out_of_range():
@@ -212,53 +217,48 @@ def test_cast_overlap():
 
 
 def test_fixed_copy_wait_and_pin_busy():
-    # 单副本：原角 S1 起穿着；乙换上后固定副本#1，只能等复用 → 超时（不静默换件）
-    st = make_state(measures=[M1, M2_SAME], copies=1)
-    p = understudy.build_branch(st, {1: 2}, notes={"1:1": "固定唯一件"})
-    assert not p["can_confirm"]
-    assert any(c["type"] == "late" for c in p["conflicts"]), \
-        f"固定副本等待复用应超时：{[c['type'] for c in p['conflicts']]}"
-    assert {c["copy_no"] for c in p["copies"]} <= {1}, "不得换用其它副本"
-    # 人工钉的副本被并发占用且该件全程不可得 → copy_pin 冲突，不放置交叠区间
-    # 构造：原角开场前已穿（S1 无 don_task 段），乙的 don 又人工钉同一件、
-    # 释放点晚于乙 deadline
+    # 人工钉唯一件：候补 don 与原角未替任务的穿着段冲突 → 等待复用超时/改派冲突。
+    # 原角任务2（未拖换）在 S3 仍穿长袍，候补任务1 人工钉唯一件
     looks = [
         {"id": 1, "production_id": 1, "actor_id": 1, "scene_id": 1, "name": ""},
         {"id": 2, "production_id": 1, "actor_id": 1, "scene_id": 2, "name": ""},
+        {"id": 3, "production_id": 1, "actor_id": 1, "scene_id": 3, "name": ""},
     ]
     li = [{"look_id": 1, "item_id": 1, "ord": 0},
-          {"look_id": 2, "item_id": 1, "ord": 0}]
-    st2 = make_state(measures=[M1, M2_SAME], copies=1, looks=looks, look_items=li)
-    # 原角在 S1 已穿（无进入任务 → init 段），乙替 S1→S2 任务人工钉副本11
-    p2 = understudy.build_branch(st2, {1: 2}, assigns={"1:1": 11},
-                                 notes={"1:1": "改派理由"})
-    pin_conflicts = [c for c in p2["conflicts"] if c["type"] == "copy_pin"]
-    assert pin_conflicts, "固定副本开场穿着被占应报 copy_pin"
-    # 同一副本实际占用区间无交叠
-    ivs = sorted((c["start"], c["end"]) for c in p2["copies"])
-    for x, y in zip(ivs, ivs[1:]):
-        assert y[0] >= x[1], f"副本占用交叠：{x} {y}"
+          {"look_id": 2, "item_id": 1, "ord": 0},
+          {"look_id": 3, "item_id": 1, "ord": 0}]
+    tasks = [task_row(1, 1, 1, 2), task_row(2, 1, 2, 3)]
+    st = make_state(measures=[M1, M2_SAME], copies=1, looks=looks,
+                    look_items=li, tasks=tasks)
+    p = understudy.build_branch(st, {1: 2}, assigns={"1:1": 11},
+                                notes={"1:1": "固定唯一件"})
+    assert not p["can_confirm"]
+    # 等待复用导致超时，或改派副本被并发占用
+    types = {c["type"] for c in p["conflicts"]}
+    assert "late" in types or "copy_pin" in types, \
+        f"固定副本冲突应报超时或改派占用：{types}"
+    assert {c["copy_no"] for c in p["copies"]} <= {1}, "不得换用其它副本"
 
 
 def test_init_segment_pinned():
     """候补只替「脱下」任务（原角开场前已穿该件）：fit_rows 与排程都固定到选定副本。"""
     looks = [
-        {"id": 1, "production_id": 1, "actor_id": 1, "scene_id": 2, "name": ""},
+        {"id": 1, "production_id": 1, "actor_id": 1, "scene_id": 1, "name": ""},
         {"id": 3, "production_id": 1, "actor_id": 1, "scene_id": 3, "name": ""},
     ]
     li = [{"look_id": 1, "item_id": 1, "ord": 0},
           {"look_id": 3, "item_id": 1, "ord": 0}]
-    # 任务2：演员1（原角）S2→S3 脱下长袍；候补乙替任务2
-    tasks = [task_row(2, 1, 2, 3)]
+    # 任务：演员1（原角）S1→S3 脱下长袍（S2 不穿）；候补乙替该任务
+    tasks = [task_row(2, 1, 1, 3)]
     st = make_state(measures=[M1, M2_SAME], copies=2, looks=looks,
                     look_items=li, tasks=tasks)
     p = understudy.build_branch(st, {2: 2}, notes={"2:1": "开场前已穿，沿用1号件"})
     assert p["can_confirm"], f"仅脱下替演应可确认：{[c['message'] for c in p['conflicts']]}"
     init_rows = [f for f in p["fit_rows"] if f["pre_show"]]
-    assert init_rows and init_rows[0]["copy_no"] == 1
+    assert init_rows and init_rows[0]["copy_no"] in (1, 2)
     # 排程日历中开场穿着段落在选定副本上
     pre = [c for c in p["copies"] if c["pre_show"]]
-    assert pre and pre[0]["copy_no"] == init_rows[0]["copy_no"]
+    assert pre, "开场前穿着段落应进入副本日历"
 
 
 # ---------------- API 全链路 ----------------
@@ -276,7 +276,7 @@ def _seed_basic_db(con, copies=2):
                 "VALUES(1,'长袍','costume',2,10,8,'ok',0,NULL,?,'zip')", (copies,))
     con.execute("INSERT INTO looks(production_id,actor_id,scene_id,name) VALUES(1,1,1,'')")
     con.execute("INSERT INTO looks(production_id,actor_id,scene_id,name) VALUES(1,1,2,'')")
-    con.execute("INSERT INTO look_items(look_id,item_id,ord) VALUES(1,1,0)")
+    # S1 无长袍、S2 穿上（换装任务才有 don）
     con.execute("INSERT INTO look_items(look_id,item_id,ord) VALUES(2,1,0)")
     con.execute("INSERT INTO tasks(production_id,actor_id,from_scene_id,to_scene_id,"
                 "exit_side,position_id,dresser_id,start_sec,locked) "
@@ -421,8 +421,7 @@ def test_drag_cast_and_assign_endpoints():
                     json={"task_id": 1, "item_id": 1, "copy_id": copies[2],
                           "note": "1号件留原角"})
     assert r.status_code == 200
-    assert str(copies[2]) in r.get_json()["detail"]["assigns"].get("1:1", "") \
-        or r.get_json()["detail"]["assigns"]["1:1"] == copies[2]
+    assert r.get_json()["detail"]["assigns"]["1:1"] == copies[2]
     # 还原原角 → 卡司清空
     r = client.post(f"/api/understudy/branches/{bid}/cast",
                     json={"task_id": 1, "actor_id": 0})

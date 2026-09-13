@@ -110,13 +110,16 @@ def wear_segments_for(state, tasks):
     segs = defaultdict(list)
 
     def has_item_change(t, iid, want_don):
-        """该任务在换场时是否真的穿/脱 item：比较两场造型清单。"""
+        """该任务在换场时是否真的穿/脱 item：比较两场造型清单。第一场无该件
+        而第二场有 → 穿上；第一场有而第二场无（含下一场完全无造型）→ 脱下。"""
         def items_in(sid):
             lid = look_of.get((t["actor_id"], sid))
-            return {li.get("item_id") for li in by_look.get(lid, [])
-                    if li.get("item_id") is not None}
+            return {i.get("id") for i in by_look.get(lid, [])
+                    if i.get("id") is not None}
         a, b = items_in(t["from_scene_id"]), items_in(t["to_scene_id"])
-        return iid in (b - a) if want_don else iid in (a - b)
+        if want_don:
+            return iid in b and iid not in a
+        return iid in a and iid not in b
 
     def segment_tasks(aid, first_sid, last_sid, iid):
         """定位本段真正穿上/脱下该件的任务：
@@ -143,10 +146,9 @@ def wear_segments_for(state, tasks):
             for k, (sid, present) in enumerate(zip(sids, present_seq)):
                 if present:
                     if run is None:
-                        # 序列首场没有进入任务（开场前已穿）；否则按进入任务判定
-                        don = None
-                        if k > 0:
-                            don, _ = segment_tasks(aid, sid, sid, iid)
+                        # 段首场：若存在 to_scene=首场且真正穿上该件的任务，
+                        # 记为 don_task（即使该演员只有这一场造型）；否则开场前已穿
+                        don, _ = segment_tasks(aid, sid, sid, iid)
                         run = {"item_id": iid, "start_scene": sid, "end_scene": sid,
                                "scenes": [sid], "don_task": don, "doff_task": None}
                     else:
@@ -199,7 +201,8 @@ def _slack(fits_of_copy, am, dims):
 
 
 def _check_cast_overlap(base, under_ids, scenes, hard):
-    """同一候补被排在两个时间相交的场次（按其在场造型，同场不重）。"""
+    """同一候补被排在两个时间相交的场次：按拖换后任务的端场时间区间判，
+    不依赖造型是否存在（脱下离场的场次也算在场）。"""
     if not under_ids:
         return
     intervals = defaultdict(dict)   # actor -> {scene_id: (start,end,tid,name)}
@@ -207,9 +210,6 @@ def _check_cast_overlap(base, under_ids, scenes, hard):
         if t["actor_id"] not in under_ids:
             continue
         for sid in (t["from_scene_id"], t["to_scene_id"]):
-            if not any(l["actor_id"] == t["actor_id"] and l["scene_id"] == sid
-                       for l in base["looks"]):
-                continue
             sc = scenes[sid]
             intervals[t["actor_id"]][sid] = (
                 sc["start_sec"], sc["start_sec"] + sc["duration_sec"], t["id"], sc["name"])
@@ -310,15 +310,14 @@ def build_branch(state, cast, assigns=None, notes=None, alter_start_sec=0):
     # 移除候补在被克隆场次的本人旧造型（不动其未涉及场次的角色造型）
     base["looks"] = [l for l in base["looks"] if l["id"] not in dropped_under_look_ids]
 
-    # 被完全替掉的「原角×场次」：候选为所有拖换任务涉及的端场；
-    # 若仍有未拖换任务让该原角在该场登台，则保留。只删克隆前的原角色造型，
-    # 不能按 (演员,场次) 匹配到刚克隆给候补的新造型。
+    # 被完全替掉的「原角×场次」：只有拖换任务**进入**（to_scene）的场次才
+    # 顶替原角；若仍有未拖换任务让该原角在该场登台则保留。任务离开的场次
+    # （from_scene）不顶替——候补本就可能在相邻场次以自己的角色登台。
     pre_clone_look_ids = {l["id"] for l in state["looks"]}
     replaced = defaultdict(set)
     for tid in swapped:
         rid = orig_of[tid]
         ot = next(t for t in state["tasks"] if t["id"] == tid)
-        replaced[rid].add(ot["from_scene_id"])
         replaced[rid].add(ot["to_scene_id"])
     for t in state["tasks"]:
         if t["id"] in swapped:
@@ -332,12 +331,21 @@ def build_branch(state, cast, assigns=None, notes=None, alter_start_sec=0):
     base["look_items"] = [li for li in base.get("look_items", [])
                           if li["look_id"] not in drop_look_ids]
 
-    # 目标场（to）候补无任何造型可沿用 → 无法推演该任务
+    # 目标场（to）候补无造型、且该任务确实需要穿上（from 场无该造型）→ 缺登记；
+    # 纯脱下任务（from 有、to 无造型）是正常换装终点，不报错。
+    by_look_now = scheduler.look_items_map(base)
     for t in base["tasks"]:
         if t["id"] not in swapped:
             continue
-        if not any(l["actor_id"] == t["actor_id"]
-                   and l["scene_id"] == t["to_scene_id"] for l in base["looks"]):
+        to_look = next((l for l in base["looks"]
+                        if l["actor_id"] == t["actor_id"]
+                        and l["scene_id"] == t["to_scene_id"]), None)
+        if to_look is None:
+            from_look = next((l for l in base["looks"]
+                              if l["actor_id"] == t["actor_id"]
+                              and l["scene_id"] == t["from_scene_id"]), None)
+            if from_look is not None:
+                continue   # 脱下离场：无目标造型正常
             add_hard(scenes[t["to_scene_id"]]["start_sec"], t["id"],
                      f"原角色在「{scenes[t['to_scene_id']]['name']}」没有造型登记，"
                      f"候补{actors.get(t['actor_id'], {}).get('name', '')}无造型可沿用",
@@ -355,10 +363,13 @@ def build_branch(state, cast, assigns=None, notes=None, alter_start_sec=0):
         sc = scenes.get(g["start_scene"])
         return sc["start_sec"] if sc else 0
 
-    # 段落 -> 关联的拖换任务：直接用段自身的 don_task/doff_task（在 swapped 内）；
-    # 开场前已穿且仅被某拖换任务触及（其 from/to 场落在覆盖场次内）时取该任务。
+    # 段落 -> 关联的拖换任务：段自身的 don_task/doff_task（在 swapped 内）都关联，
+    # 保证同一段的穿上/脱下共用一件选定副本；开场前已穿且仅被任务触及时取该任务。
+    # 道具不走尺寸适配与副本固定。
     seg_tasks = defaultdict(list)
     for (aid, iid), lst in segs.items():
+        if items[iid]["kind"] == "prop":
+            continue
         for g in lst:
             key = (aid, iid, g["start_scene"])
             for ttid, role in ((g.get("don_task"), "don"), (g.get("doff_task"), "doff")):
@@ -375,6 +386,8 @@ def build_branch(state, cast, assigns=None, notes=None, alter_start_sec=0):
 
     seg_list = []
     for (aid, iid, _scid), pairs in seg_tasks.items():
+        if not pairs:
+            continue
         g = pairs[0][0]
         # 穿上任务代表该段；否则脱下任务；都没有（连续穿着）取最小任务号
         role_rank = {"don": 0, "doff": 1, "touch": 2}
@@ -395,8 +408,9 @@ def build_branch(state, cast, assigns=None, notes=None, alter_start_sec=0):
                   for c in copies_by_item.get(iid, [])]
         return it, dims, am, om, scored
 
-    # 4a) 人工改派先固定（严格占用：排程只用该件，不换副本；可等复用）
-    for g, tid, aid, iid, _role in seg_list:
+    # 4a) 人工改派先固定（严格占用：排程只用该件，不换副本；可等复用）。
+    #     don/touch 段固定为穿上 pin；纯 doff 段固定为开场前穿着（init）pin。
+    for g, tid, aid, iid, role in seg_list:
         key = f"{tid}:{iid}"
         mid = assigns.get(key)
         if mid is None:
@@ -412,7 +426,8 @@ def build_branch(state, cast, assigns=None, notes=None, alter_start_sec=0):
         chosen_init[(aid, iid, g["start_scene"])] = mc
         manual_keys.add((tid, iid))
         reserved[iid].add(mc["copy_no"])
-        pin_copy[(tid, iid)] = mc["copy_no"] - 1
+        if role != "doff":
+            pin_copy[(tid, iid)] = mc["copy_no"] - 1
         decisions.append({
             "task_id": tid, "item_id": iid, "kind": "manual",
             "reason": f"人工改派副本：{it['name']}→第{mc['copy_no']}件",
@@ -483,13 +498,15 @@ def build_branch(state, cast, assigns=None, notes=None, alter_start_sec=0):
                           f"（最长 {ev['max_alter_sec']}s）",
                 "need_note": True, "alter_sec": ev["max_alter_sec"],
                 "noted": bool((notes.get(key) or "").strip())})
-        # 穿上与脱下时长：穿上按选定件；脱下按同一候补穿着该件时的选定件
-        don_dur, _d1, _c1 = duration_override(it, am, om, c, "don")
-        dur_ov[(tid, iid, "don")] = don_dur
-        doff_c = c
-        if g.get("don_task") and g["don_task"] != tid:
-            doff_c = chosen.get((g["don_task"], iid), c)
-        dur_ov[(tid, iid, "doff")] = duration_override(it, am, om, doff_c, "doff")[0]
+        # 穿/脱时长：穿上任务按选定件；脱下任务按同段穿上任务选定的件
+        role = _role
+        if role in ("don", "touch"):
+            dur_ov[(tid, iid, "don")] = duration_override(it, am, om, c, "don")[0]
+        if role in ("doff", "touch"):
+            doff_c = c
+            if g.get("don_task") and g["don_task"] != tid:
+                doff_c = chosen.get((g["don_task"], iid), c)
+            dur_ov[(tid, iid, "doff")] = duration_override(it, am, om, doff_c, "doff")[0]
         fit_rows_out.append({
             "task_id": tid, "item_id": iid, "copy_no": c["copy_no"],
             "copy_id": c["id"],
@@ -498,7 +515,8 @@ def build_branch(state, cast, assigns=None, notes=None, alter_start_sec=0):
             "direct": ev["direct"], "alter": ev["alter"], "out": ev["out"],
             "boundary": ev["boundary"], "missing": ev["missing"],
             "actor_id": aid, "actor_name": aname,
-            "pre_show": g.get("don_task") is None,
+            # 开场前已穿：段既无穿上任务也无脱下任务（纯在场段）
+            "pre_show": g.get("don_task") is None and g.get("doff_task") is None,
             "note": notes.get(key, "")})
 
     # 6) 开场前已穿着段落（无 don_task）：仅人工改派的段落钉死选定副本；

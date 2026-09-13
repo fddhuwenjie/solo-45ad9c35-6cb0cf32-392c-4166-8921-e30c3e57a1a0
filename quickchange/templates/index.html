@@ -64,6 +64,68 @@
     <div id="run-summary"><p class="muted">暂无已结束的连排</p></div>
   </section>
 
+  <section id="panel-understudy">
+    <h2>替演推演 <span class="hint">从任一修订拖换卡司；候补沿用原角造型，按尺寸匹配副本并重排</span></h2>
+    <div class="run-bar">
+      <select id="ub-rev"></select>
+      <input id="ub-name" placeholder="分支名（如 周屿替林澜）">
+      <input id="ub-alter" type="number" placeholder="改衣可开工时刻(秒)" title="改衣可开始的演出时钟秒">
+      <button id="btn-ub-new">从修订开启替演分支</button>
+      <span class="sep"></span>
+      <select id="ub-sel"></select>
+      <button id="btn-ub-confirm" class="warn">确认冻结</button>
+      <button id="btn-ub-sheet">替演换装单</button>
+      <button id="btn-ub-svg">差异SVG</button>
+      <button id="btn-ub-del">删除草稿</button>
+    </div>
+    <div class="ub-layout">
+      <div class="ub-left">
+        <h3>候补顺位 & 关键尺寸</h3>
+        <div class="eform">
+          <select id="ub-role"></select>
+          <select id="ub-under"></select>
+          <input id="ub-prio" type="number" value="1" placeholder="顺位">
+          <button id="btn-ub-roster">登记候补</button>
+        </div>
+        <div class="eform">
+          <select id="ub-actor"></select>
+          <div class="ub-measures" id="ub-measures"></div>
+          <button id="btn-ub-measures">保存关键尺寸</button>
+        </div>
+        <h3>副本适配区间 / 可调部位 / 改衣耗时</h3>
+        <div class="eform">
+          <select id="ub-item"></select>
+          <select id="ub-copy"></select>
+          <select id="ub-closure">
+            <option value="">闭合件=服装默认</option>
+            <option value="zip">拉链</option>
+            <option value="hook">钩扣(+穿4/脱3)</option>
+            <option value="tie">系带(+穿10/脱8)</option>
+            <option value="frog">盘扣(+穿14/脱10)</option>
+          </select>
+          <button id="btn-ub-closure">保存闭合件</button>
+          <select id="ub-dim"></select>
+          <input id="ub-lo" type="number" placeholder="下限cm">
+          <input id="ub-hi" type="number" placeholder="上限cm">
+          <label class="ub-chk"><input id="ub-alt" type="checkbox"> 可调</label>
+          <input id="ub-altsec" type="number" placeholder="改衣秒">
+          <button id="btn-ub-fit">保存适配区间</button>
+          <button id="btn-ub-fit-del" class="warn">删除该部位区间</button>
+          <div id="ub-fit-list" class="ubfitlist"></div>
+        </div>
+      </div>
+      <div class="ub-right">
+        <h3>拖换卡司（点任务行选候补）</h3>
+        <div id="ub-cast"></div>
+        <h3>原计划 vs 替演 叠放时间轴</h3>
+        <svg id="ub-svg" width="100%" viewBox="0 0 1180 320" preserveAspectRatio="xMidYMin meet"></svg>
+        <div id="ub-conflicts"></div>
+        <h3>副本适配决定（边界/改衣/改派需备注）</h3>
+        <div id="ub-fits"></div>
+      </div>
+    </div>
+  </section>
+
   <div class="row">
     <section id="panel-plan">
       <h2>侧台平面图 <span class="hint">选中任务后显示走位路线</span></h2>

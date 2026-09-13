@@ -1030,6 +1030,331 @@ async function renderSummary() {
 
 
 
+/* ---------------- 替演推演 ---------------- */
+
+let UB = { branchId: null, detail: null };
+const UB_DIMS = [["height", "身高"], ["chest", "胸围"], ["waist", "腰围"],
+  ["hip", "臀围"], ["shoulder", "肩宽"], ["foot", "脚长"]];
+
+async function ubApi(url, method = "GET", body) {
+  const r = await fetch(url, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok || j.ok === false) {
+    alert(j.error || `请求失败 ${r.status}`);
+    return null;
+  }
+  if (j.state) await refresh(j.state);
+  return j;
+}
+
+function ubBaseSnap() {
+  // 分支基准修订的快照任务/场次（从 detail 无法取，用当前 state 的 revisions 找）
+  return null;
+}
+
+function renderUnderstudy() {
+  const rev = $("#ub-rev");
+  rev.innerHTML = S.revisions.length
+    ? S.revisions.map((r) => `<option value="${r.id}">修订#${r.id} ${r.note || ""}</option>`).join("")
+    : '<option value="">（先保存修订）</option>';
+  const actors = S.actors.map((a) => `<option value="${a.id}">${a.name}</option>`).join("");
+  $("#ub-role").innerHTML = actors;
+  $("#ub-under").innerHTML = actors;
+  $("#ub-actor").innerHTML = actors;
+  $("#ub-item").innerHTML = S.items.filter((i) => i.kind !== "prop")
+    .map((i) => `<option value="${i.id}">#${i.id} ${i.name}（${i.copies}件）</option>`).join("");
+  $("#ub-dim").innerHTML = UB_DIMS.map(([k, n]) => `<option value="${k}">${n}</option>`).join("");
+  ubFillMeasures();
+  ubFillCopies();
+  // 分支选择
+  const sel = $("#ub-sel");
+  const list = S.understudy_branches || [];
+  sel.innerHTML = '<option value="">不查看分支</option>' + list.map((b) =>
+    `<option value="${b.id}" ${b.id === UB.branchId ? "selected" : ""}>` +
+    `#${b.id} ${b.name} ${b.status === "confirmed" ? "（已冻结）" : "（草稿）"}` +
+    `${b.needs_review ? " ⚠待复核" : ""}</option>`).join("");
+  renderRoster();
+  renderBranch();
+}
+
+function ubFillMeasures() {
+  const aid = +$("#ub-actor").value;
+  const m = (S.actor_measures || []).find((x) => x.actor_id === aid) || {};
+  $("#ub-measures").innerHTML = UB_DIMS.map(([k, n]) =>
+    `<label>${n}<input type="number" step="0.1" data-m="${k}" value="${m[k] ?? ""}"></label>`).join("");
+}
+
+function ubFillCopies() {
+  const iid = +$("#ub-item").value;
+  const copies = (S.item_copies || []).filter((c) => c.item_id === iid);
+  const sel = $("#ub-copy");
+  sel.innerHTML = copies.map((c) =>
+    `<option value="${c.id}">第${c.copy_no}件 ${c.label || ""} ${c.closure || ""}</option>`).join("")
+    || '<option value="">（无副本）</option>';
+  ubFillFitList();
+}
+
+function ubFillFitList() {
+  const cid = +($("#ub-copy").value || 0);
+  const rows = (S.copy_fit || []).filter((f) => f.copy_id === cid);
+  const name = Object.fromEntries(UB_DIMS);
+  $("#ub-fit-list").innerHTML = rows.map((f) =>
+    `<div>${name[f.dim] || f.dim}：${f.lo}–${f.hi} ` +
+    `${f.alterable ? `可调(${f.alter_sec}s)` : "不可调"}</div>`).join("") || "<div>暂无适配区间</div>";
+}
+
+function renderRoster() {
+  // 候补信息内联在任务行选择，不单独列；此处占位
+}
+
+function ubRosterName(roleId, underId) {
+  const a = S.actors.find((x) => x.id === underId);
+  return a ? a.name : "#" + underId;
+}
+
+async function loadBranch(id) {
+  UB.branchId = id || null;
+  UB.detail = null;
+  if (id) {
+    const j = await ubApi(`/api/understudy/branches/${id}`);
+    if (j) UB.detail = j;
+  }
+  renderAll();
+}
+
+function renderBranch() {
+  const d = UB.detail;
+  if (!d) {
+    $("#ub-cast").innerHTML = '<p class="muted">选择或创建分支后从任务行拖换卡司</p>';
+    $("#ub-conflicts").innerHTML = "";
+    $("#ub-fits").innerHTML = "";
+    const svg = $("#ub-svg");
+    if (svg) svg.innerHTML = "";
+    return;
+  }
+  const p = d.plan;
+  const frozen = d.branch.status === "confirmed";
+  $("#btn-ub-confirm").disabled = frozen || !(p && p.can_confirm);
+  $("#btn-ub-del").disabled = frozen;
+  renderCast(d, frozen);
+  renderUbSvg(d);
+  renderUbConflicts(d);
+  renderUbFits(d, frozen);
+}
+
+function renderCast(d, frozen) {
+  const p = d.plan;
+  // 基准修订快照任务：用 plan.windows 的 id 与当前 S.tasks 合并取信息
+  const tasks = S.tasks;
+  const scenes = S.scenes;
+  const cast = p.cast || {};
+  const box = $("#ub-cast");
+  const sorted = tasks.slice().sort((a, b) =>
+    ((p.windows[a.id] || {}).start || 0) - ((p.windows[b.id] || {}).start || 0));
+  box.innerHTML = sorted.map((t) => {
+    const fs = scenes.find((s) => s.id === t.from_scene_id);
+    const ts = scenes.find((s) => s.id === t.to_scene_id);
+    const orig = S.actors.find((a) => a.id === t.actor_id);
+    const under = cast[t.id] ? +cast[t.id] : t.actor_id;
+    // 候补顺位：该原角的 roster
+    const roster = (S.understudy_roster || [])
+      .filter((r) => r.role_actor_id === t.actor_id)
+      .sort((a, b) => a.priority - b.priority);
+    const opts = [orig, ...roster.map((r) => S.actors.find((a) => a.id === r.under_actor_id))
+      .filter(Boolean)];
+    const uniq = [];
+    opts.forEach((a) => a && !uniq.find((u) => u.id === a.id) && uniq.push(a));
+    const sel = `<select data-task="${t.id}" ${frozen ? "disabled" : ""}>` +
+      uniq.map((a) => `<option value="${a.id}" ${a.id === under ? "selected" : ""}>${a.name}</option>`).join("") +
+      `</select>`;
+    const swapped = cast[t.id] ? '<span class="tag2 manual">已替演</span>' : "";
+    return `<div class="ub-task ${cast[t.id] ? "swapped" : ""}" data-task="${t.id}">` +
+      `<b>#${t.id}</b><span class="tmeta">${fs ? fs.name : ""}→${ts ? ts.name : ""} 原角 ${orig ? orig.name : ""}</span>` +
+      sel + swapped +
+      (cast[t.id] && !frozen ? `<span class="reset" data-reset="${t.id}">还原原角</span>` : "") +
+      `</div>`;
+  }).join("");
+  box.querySelectorAll("select").forEach((s) => {
+    s.onchange = async () => {
+      const tid = s.dataset.task;
+      const aid = +s.value;
+      const origTask = tasks.find((t) => t.id === +tid);
+      const actorId = aid === origTask.actor_id ? 0 : aid;
+      await ubApi(`/api/understudy/branches/${UB.branchId}/cast`, "POST",
+        { task_id: +tid, actor_id: actorId });
+      await loadBranch(UB.branchId);
+    };
+  });
+  box.querySelectorAll("[data-reset]").forEach((x) => {
+    x.onclick = async () => {
+      await ubApi(`/api/understudy/branches/${UB.branchId}/cast`, "POST",
+        { task_id: +x.dataset.reset, actor_id: 0 });
+      await loadBranch(UB.branchId);
+    };
+  });
+}
+
+function renderUbConflicts(d) {
+  const p = d.plan;
+  const box = $("#ub-conflicts");
+  if (p.can_confirm) {
+    box.innerHTML = '<div class="ub-conf ok">推演通过，可确认冻结 ✓</div>';
+    return;
+  }
+  box.innerHTML = p.conflicts.slice(0, 12).map((c, i) =>
+    `<div class="ub-conf ${c.type === "need_note" ? "need_note" : ""}" data-i="${i}">` +
+    `[${fmt(c.time)}] <b>${ubTypeCn(c.type)}</b> 任务#${c.task_id} ${esc(c.message)}</div>`).join("")
+    + (p.conflicts.length > 12 ? `<div class="muted">…另有 ${p.conflicts.length - 12} 条</div>` : "");
+  box.querySelectorAll(".ub-conf").forEach((el) => {
+    el.onclick = () => {
+      const c = p.conflicts[+el.dataset.i];
+      selectedTask = c.task_id;
+      renderAll();
+    };
+  });
+}
+
+function ubTypeCn(t) {
+  return { measure: "尺寸缺失", fit: "适配越界", cast_overlap: "场次重叠",
+    copy_pin: "副本占用", item: "副本占用", late: "来不及开场",
+    staffing: "人手不足", arrival: "到岗冲突", alter_late: "改衣超时",
+    need_note: "需备注", no_look: "缺造型", no_copy: "缺副本",
+    manual: "人工改派", position: "换装位", actor: "演员冲突" }[t] || t;
+}
+
+function renderUbFits(d, frozen) {
+  const p = d.plan;
+  const items = Object.fromEntries(S.items.map((i) => [i.id, i]));
+  $("#ub-fits").innerHTML = p.fit_rows.map((f, idx) => {
+    const it = items[f.item_id];
+    const key = `${f.task_id}:${f.item_id}`;
+    const copies = (S.item_copies || []).filter((c) => c.item_id === f.item_id);
+    const note = d.notes[key] || "";
+    const tags = [
+      f.manual ? '<span class="tag2 manual">人工改派</span>' : "",
+      f.boundary && f.boundary.length ? `<span class="tag2 boundary">边界 ${f.boundary.map(ubDimCn).join("/")}</span>` : "",
+      f.alter && f.alter.length ? `<span class="tag2 alter">改衣 ${f.alter.map(ubDimCn).join("/")}</span>` : "",
+    ].join("");
+    const opts = copies.map((c) =>
+      `<option value="${c.id}" ${c.copy_no === f.copy_no ? "selected" : ""}>第${c.copy_no}件</option>`).join("");
+    return `<div class="ub-fit ${f.status}">` +
+      `<b>#${f.task_id}</b><span>${f.actor_name}</span><span>${it ? it.name : f.item_id}</span>` +
+      `<span>${f.status}${f.pre_show ? "·开场前已穿" : ""}</span>` +
+      `<select data-assign='${JSON.stringify({ idx, key })}' ${frozen ? "disabled" : ""}>${opts}</select>` +
+      tags +
+      `<input class="note" placeholder="边界/改衣/改派备注（必填）" value="${esc(note)}" ` +
+      `data-note='${JSON.stringify({ key })}' ${frozen ? "disabled" : ""}></div>`;
+  }).join("");
+  $("#ub-fits").querySelectorAll("select[data-assign]").forEach((s) => {
+    s.onchange = async () => {
+      const meta = JSON.parse(s.dataset.assign);
+      const [tid, iid] = meta.key.split(":").map(Number);
+      const note = (d.notes[meta.key] || "").trim();
+      let noteText = note || prompt("人工改派必须填写备注：", "");
+      if (!noteText) { await loadBranch(UB.branchId); return; }
+      await ubApi(`/api/understudy/branches/${UB.branchId}/assign`, "POST",
+        { task_id: tid, item_id: iid, copy_id: +s.value, note: noteText });
+      await loadBranch(UB.branchId);
+    };
+  });
+  $("#ub-fits").querySelectorAll("input[data-note]").forEach((inp) => {
+    inp.onchange = async () => {
+      const meta = JSON.parse(inp.dataset.note);
+      const [tid, iid] = meta.key.split(":").map(Number);
+      await ubApi(`/api/understudy/branches/${UB.branchId}/note`, "POST",
+        { task_id: tid, item_id: iid, note: inp.value });
+      await loadBranch(UB.branchId);
+    };
+  });
+}
+
+function ubDimCn(d) {
+  return Object.fromEntries(UB_DIMS)[d] || d;
+}
+
+function renderUbSvg(d) {
+  const p = d.plan;
+  const svg = $("#ub-svg");
+  const W = 1180, L = 60, R = 30, top = 34, laneH = 52;
+  const scenes = S.scenes;
+  const tasks = S.tasks;
+  const total = Math.max(...scenes.map((s) => s.start_sec + s.duration_sec), 600) + 60;
+  const x = (t) => L + (W - L - R) * t / total;
+  const cast = p.cast || {};
+  const actorIds = new Set();
+  tasks.forEach((t) => {
+    actorIds.add(t.actor_id);
+    if (cast[t.id]) actorIds.add(+cast[t.id]);
+  });
+  const actors = S.actors.filter((a) => actorIds.has(a.id));
+  const h = top + laneH * Math.max(1, actors.length) + 30;
+  svg.setAttribute("viewBox", `0 0 ${W} ${h}`);
+  let g = "";
+  scenes.forEach((s) => {
+    const sx = x(s.start_sec), sw = (W - L - R) * s.duration_sec / total;
+    g += el("rect", { x: sx, y: 8, width: sw, height: 14, fill: "#dde6f2" });
+    g += `<text x="${sx + 2}" y="19" fill="#334" font-size="11">${esc(s.name)}</text>`;
+  });
+  actors.forEach((a, i) => {
+    const y = top + i * laneH;
+    g += `<text x="2" y="${y + 24}" font-size="12">${esc(a.name)}</text>`;
+    g += el("line", { x1: L, y1: y + laneH - 2, x2: W - R, y2: y + laneH - 2, stroke: "#eee" });
+  });
+  // 原计划条（灰，上排）：基于基准快照排程结果不可得，用 plan.actions 里未替任务
+  // 简化：所有任务用 windows；替演任务上排画「原角」起点（灰）、下排画替演
+  tasks.forEach((t) => {
+    const i = actors.findIndex((a) => a.id === t.actor_id);
+    if (i < 0) return;
+    const y = top + i * laneH;
+    const w = p.windows[t.id];
+    const isSwap = cast[t.id];
+    if (w) {
+      const color = isSwap ? "#95a5a6" : (!w.ok ? "#c0392b" : "#7f8c8d");
+      g += ubBar(x, y + 4, w, color, `#${t.id}原`);
+    }
+  });
+  Object.entries(cast).forEach(([tid, aid]) => {
+    const i = actors.findIndex((a) => a.id === +aid);
+    if (i < 0) return;
+    const w = p.windows[tid];
+    if (!w) return;
+    const y = top + i * laneH;
+    g += ubBar(x, y + 21, w, w.ok ? "#8e44ad" : "#c0392b", `#${tid}替`);
+  });
+  // 冲突三角（定位最早）
+  p.conflicts.forEach((c, i) => {
+    const aid = cast[c.task_id] ? +cast[c.task_id] :
+      (tasks.find((t) => t.id === c.task_id) || {}).actor_id;
+    const i2 = actors.findIndex((a) => a.id === aid);
+    if (i2 < 0) return;
+    const cx = x(c.time), cy = top + i2 * laneH + laneH - 4;
+    const col = i === 0 ? "#e67e22" : "#e74c3c";
+    g += `<path d="M${cx},${cy} l5,-8 l5,8 z" fill="${col}"/>` +
+      `<title>${esc(c.message)}</title>`;
+  });
+  const ly = h - 18;
+  g += `<rect x="${L}" y="${ly - 10}" width="12" height="12" fill="#7f8c8d"/><text x="${L + 16}" y="${ly}">原计划</text>` +
+    `<rect x="${L + 80}" y="${ly - 10}" width="12" height="12" fill="#8e44ad"/><text x="${L + 96}" y="${ly}">替演</text>` +
+    `<path d="M${L + 150},${ly + 2} l5,-8 l5,8 z" fill="#e67e22"/><text x="${L + 164}" y="${ly}">最早冲突</text>`;
+  svg.innerHTML = g;
+}
+
+function ubBar(x, y, w, color, label) {
+  const W = 1180;
+  const bx = x(w.start), bw = Math.max(4, x(w.end) - x(w.start));
+  let s = el("rect", { x: bx, y, width: bw, height: 13, rx: 2, fill: color, opacity: 0.92 });
+  s += `<text x="${bx + 2}" y="${y + 10}" fill="#fff" font-size="9">${esc(label)}</text>`;
+  s += el("line", { x1: x(w.deadline), y1: y - 2, x2: x(w.deadline), y2: y + 17,
+    stroke: "#c0392b", "stroke-dasharray": "3 2" });
+  return s;
+}
+
+
+
 function renderAll() {
   renderTimeline();
   renderDresserPalette();
@@ -1044,6 +1369,7 @@ function renderAll() {
   renderPunch();
   renderRunChecks();
   renderSummary();
+  renderUnderstudy();
   const sel = $("#export-actor");
   sel.innerHTML = S.actors.map((a) => `<option value="${a.id}">${a.name}</option>`).join("");
   const dsel = $("#export-dresser");
@@ -1091,6 +1417,81 @@ $("#btn-clock-now").onclick = () => {
   const t = S.tasks.find((x) => x.id === selectedTask);
   const w = t && S.schedule.windows[t.id];
   if (w) $("#run-clock").value = fmt(Math.round(w.start));
+};
+
+/* 替演推演事件 */
+$("#ub-actor").onchange = ubFillMeasures;
+$("#ub-item").onchange = ubFillCopies;
+$("#ub-copy").onchange = ubFillFitList;
+
+$("#btn-ub-roster").onclick = async () => {
+  await ubApi("/api/understudy/roster", "POST", {
+    role_actor_id: +$("#ub-role").value,
+    under_actor_id: +$("#ub-under").value,
+    priority: +$("#ub-prio").value || 1,
+  });
+};
+$("#btn-ub-measures").onclick = async () => {
+  const body = {};
+  $("#ub-measures").querySelectorAll("input").forEach((inp) => {
+    if (inp.value !== "") body[inp.dataset.m] = +inp.value;
+  });
+  await ubApi(`/api/actors/${$("#ub-actor").value}/measures`, "POST", body);
+};
+$("#btn-ub-closure").onclick = async () => {
+  const cid = +$("#ub-copy").value;
+  if (!cid) return alert("请先选择副本");
+  await ubApi(`/api/item_copies/${cid}`, "POST", { closure: $("#ub-closure").value });
+};
+$("#btn-ub-fit").onclick = async () => {
+  const cid = +$("#ub-copy").value;
+  const lo = +$("#ub-lo").value, hi = +$("#ub-hi").value;
+  if (!cid || !lo || !hi) return alert("请选择副本并填写上下限");
+  await ubApi(`/api/item_copies/${cid}/fit`, "POST", {
+    dim: $("#ub-dim").value, lo, hi,
+    alterable: $("#ub-alt").checked, alter_sec: +$("#ub-altsec").value || 0,
+  });
+};
+$("#btn-ub-fit-del").onclick = async () => {
+  const cid = +$("#ub-copy").value;
+  await ubApi(`/api/item_copies/${cid}/fit`, "POST", { dim: $("#ub-dim").value });
+};
+
+$("#btn-ub-new").onclick = async () => {
+  const rid = +$("#ub-rev").value;
+  if (!rid) return alert("请先保存一个修订");
+  const j = await ubApi("/api/understudy/branches", "POST", {
+    revision_id: rid,
+    name: $("#ub-name").value.trim(),
+    alter_start_sec: +$("#ub-alter").value || 0,
+  });
+  if (j) {
+    UB.branchId = j.id;
+    $("#ub-name").value = "";
+    await loadBranch(j.id);
+  }
+};
+$("#ub-sel").onchange = (e) => loadBranch(e.target.value ? +e.target.value : null);
+$("#btn-ub-confirm").onclick = async () => {
+  if (!UB.branchId || !confirm("确认后卡司、适配决定与受影响任务将冻结，不能再拖换。继续？")) return;
+  const j = await ubApi(`/api/understudy/branches/${UB.branchId}/confirm`, "POST");
+  if (j) await loadBranch(UB.branchId);
+};
+$("#btn-ub-del").onclick = async () => {
+  if (!UB.branchId || !confirm("删除该草稿分支？")) return;
+  await ubApi(`/api/understudy/branches/${UB.branchId}`, "DELETE");
+  UB.branchId = null;
+  await loadBranch(null);
+};
+$("#btn-ub-sheet").onclick = () =>
+  UB.branchId ? window.open(`/export/understudy/${UB.branchId}/sheet`) : alert("请先选择分支");
+$("#btn-ub-svg").onclick = () =>
+  UB.branchId ? window.open(`/export/understudy/${UB.branchId}/diff.svg?dl=1`) : alert("请先选择分支");
+$("#ub-alter").onchange = async () => {
+  if (!UB.branchId) return;
+  await ubApi(`/api/understudy/branches/${UB.branchId}/alter_start`, "POST",
+    { alter_start_sec: +$("#ub-alter").value || 0 });
+  await loadBranch(UB.branchId);
 };
 
 refresh();

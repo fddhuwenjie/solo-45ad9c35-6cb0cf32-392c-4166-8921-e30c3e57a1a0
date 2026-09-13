@@ -125,6 +125,45 @@ button.mini { padding: 1px 6px; font-size: 10px; background: #95a5a6; }
 .arow select, .arow input { padding: 1px 3px; font-size: 10px; }
 .askill { width: 78px; }
 
+/* 替演推演 */
+#panel-understudy .run-bar select, #panel-understudy .run-bar input { max-width: 240px; }
+.ub-layout { display: flex; gap: 14px; align-items: flex-start; }
+.ub-left { width: 320px; flex: none; }
+.ub-right { flex: 1; min-width: 0; }
+.ub-left .eform { width: 100%; margin-bottom: 10px; }
+.ub-measures { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; margin: 4px 0; }
+.ub-measures label { font-size: 11px; color: #555; display: flex; align-items: center; gap: 3px; }
+.ub-measures input { width: 100%; }
+.ub-chk { font-size: 12px; display: inline-flex; align-items: center; gap: 3px; }
+.ubfitlist { font-size: 11px; margin-top: 4px; color: #555; }
+.ubfitlist div { padding: 1px 0; border-bottom: 1px dotted #eee; }
+#ub-cast { font-size: 12px; max-height: 200px; overflow: auto; margin-bottom: 6px; }
+.ub-task { border: 1px solid #e3e6ea; border-radius: 4px; padding: 4px 7px; margin-bottom: 4px;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; background: #fafbfc; }
+.ub-task.swapped { border-left: 4px solid #8e44ad; background: #f6eef9; }
+.ub-task b { min-width: 46px; }
+.ub-task select { padding: 2px 4px; font-size: 12px; }
+.ub-task .tmeta { color: #888; font-size: 11px; }
+.ub-task .reset { color: #c0392b; cursor: pointer; font-size: 11px; }
+#ub-svg { background: #fcfdff; border: 1px solid #eef1f5; border-radius: 4px; }
+#ub-conflicts { margin: 6px 0; }
+.ub-conf { font-size: 12px; padding: 4px 8px; border-radius: 4px; margin: 3px 0;
+  background: #fdecea; border-left: 3px solid #e74c3c; cursor: pointer; }
+.ub-conf.need_note { background: #fef5e7; border-left-color: #e67e22; }
+.ub-conf.ok { background: #eafaf1; border-left-color: #27ae60; color: #1e8449; }
+#ub-fits { font-size: 12px; max-height: 220px; overflow: auto; }
+.ub-fit { border: 1px solid #e3e6ea; border-radius: 4px; padding: 4px 7px; margin-bottom: 4px;
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap; background: #fff; }
+.ub-fit.合身 { border-left: 4px solid #27ae60; }
+.ub-fit.需改衣 { border-left: 4px solid #e67e22; }
+.ub-fit.越界 { border-left: 4px solid #c0392b; }
+.ub-fit input.note { flex: 1; min-width: 140px; padding: 2px 5px; font-size: 11px; }
+.ub-fit select { padding: 1px 3px; font-size: 11px; }
+.ub-fit .tag2 { font-size: 10px; padding: 0 6px; border-radius: 8px; background: #ecf0f1; }
+.ub-fit .tag2.manual { background: #d6eaf8; }
+.ub-fit .tag2.alter { background: #fdebd0; }
+.ub-fit .tag2.boundary { background: #fcf3cf; }
+
 .pstaff { display: inline-flex; gap: 4px; flex-wrap: wrap; }
 .pstaff label { font-size: 10px; background: #eef3f8; border-radius: 8px; padding: 0 6px; }
 .pstaff label.mismatch { background: #fdedec; color: #c0392b; }

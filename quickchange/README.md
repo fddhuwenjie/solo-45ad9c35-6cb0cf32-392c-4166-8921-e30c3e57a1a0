@@ -51,10 +51,32 @@ python3 app.py         # 依赖 Flask（本环境装在 ../.pylibs，app.py 已�
 | POST | `/api/runs/derive` | `{run_id, keys}` 从所选连排的基准修订派生新修订（不触碰当前方案） |
 | GET | `/export/cue/<actor_id>`、`/export/flow.csv`、`/export/timeline.svg` | 三类计划导出 |
 | GET | `/export/run/<id>/compare.svg`、`/export/run/<id>/record` | 计划—实测 SVG、连排记录 |
+| GET | `/export/understudy/<id>/sheet`、`/export/understudy/<id>/diff.svg` | 替演换装单、原计划—替演差异 SVG |
+
+## 替演推演（午场临时换角）
+
+- 候补顺位：`POST /api/understudy/roster`（原角/候补/顺位），`DELETE /api/understudy/roster/<id>`
+- 演员关键尺寸：`POST /api/actors/<id>/measures`（身高/胸围/腰围/臀围/肩宽/脚长）
+- 实物副本：随 items.copies 自动物化；`POST /api/item_copies/<id>` 改闭合件
+  （zip/hook/tie/frog），`POST /api/item_copies/<id>/fit` 登记部位适配区间、
+  是否可调与改衣耗时
+- 分支：`POST /api/understudy/branches`（从修订开启）、`GET .../branches/<id>`、
+  `.../cast`（拖换/还原卡司）、`.../assign`（人工改派，必须备注）、
+  `.../note`、`.../alter_start`（改衣可开工时刻）、`.../confirm`（冻结）、
+  `.../clear_review`、`DELETE`
+
+候补换角后**沿用原角色在对应场次的造型**，不需另建个人造型；系统逐部位判定
+合身/需改衣/越界，按尺寸偏差与闭合件调整穿脱时长，再用既有引擎重排分工、走位
+与副本日历。人工改派严格固定该件（被并发占用即冲突）。确认版冻结卡司、适配决定
+与受影响任务；之后原角或候补尺寸、服装、副本/适配资料变化只把相关分支标为
+「待复核」，不改动冻结计划。尺寸缺失、适配越界、场次重叠、副本并发占用、改衣
+赶不上开场、来不及开场都会定位最早冲突并禁止确认；边界尺寸、人工改派、需改衣
+必须备注。
 
 ## 测试
 
 ```bash
 python3 test_regression.py   # 排程/锁定/副本占用回归
 python3 test_rehearsal.py    # 连排实测：冻结基准、打点校验、四类检查、等待链、派生修订
+python3 test_understudy.py   # 替演推演：沿用原角造型、适配/备注阻断、改衣、冻结、待复核
 ```
