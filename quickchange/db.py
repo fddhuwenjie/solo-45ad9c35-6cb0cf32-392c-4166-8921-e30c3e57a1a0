@@ -648,28 +648,35 @@ def delete_branch(branch_id):
 
 
 def mark_understudy_dirty(pid, actor_ids=None, item_ids=None):
-    """资料变化时只标记相关替演分支待复核：
-    - 演员尺寸变化：卡司用到该演员（原角或候补）的分支；
-    - 服装/副本/适配变化：基准快照中含该服装的分支。
-    已确认分支只打标记、计划不重算；草稿分支提示资料已变、请重新推演。"""
+    """资料变化时只标记相关替演分支待复核（已确认分支计划不重算，只打标记）：
+    - 演员（含原角与候补）尺寸变化：卡司引用了该演员（任一拖换任务的原角
+      或候补）的分支——候补尺寸决定适配，原角尺寸决定尺寸偏差加时；
+    - 服装/副本/适配变化：基准快照中含该服装的分支。"""
     con = connect()
     try:
+        actor_ids = {int(x) for x in (actor_ids or [])}
+        item_ids = {int(x) for x in (item_ids or [])}
         branches = rows(con,
-            "SELECT id, revision_id, cast_json FROM understudy_branches "
-            "WHERE production_id=?", (pid,))
+            "SELECT b.id, b.cast_json, b.revision_id FROM understudy_branches b "
+            "WHERE b.production_id=?", (pid,))
+        # 修订快照的 task_id -> 原角 actor_id（用于匹配原角尺寸变化）
+        rev_orig = {}
         for b in branches:
             cast = json.loads(b["cast_json"] or "{}")
+            orig = set()
+            rev = row(con, "SELECT snapshot FROM revisions WHERE id=?", (b["revision_id"],))
+            if rev:
+                tmap = {t["id"]: t["actor_id"]
+                        for t in json.loads(rev["snapshot"]).get("tasks", [])}
+                orig = {tmap.get(int(k)) for k in cast} - {None}
+            under = {int(v) for v in cast.values()}
             hit = False
-            if actor_ids:
-                used = {int(v) for v in cast.values()} | {int(k) for k in cast.keys()}
-                if {int(x) for x in actor_ids} & used:
+            if actor_ids and actor_ids & (under | orig):
+                hit = True
+            if item_ids and rev:
+                snap_items = {i["id"] for i in json.loads(rev["snapshot"]).get("items", [])}
+                if item_ids & snap_items:
                     hit = True
-            if item_ids:
-                rev = row(con, "SELECT snapshot FROM revisions WHERE id=?", (b["revision_id"],))
-                if rev:
-                    snap_items = {i["id"] for i in json.loads(rev["snapshot"]).get("items", [])}
-                    if {int(x) for x in item_ids} & snap_items:
-                        hit = True
             if hit:
                 con.execute("UPDATE understudy_branches SET needs_review=1 WHERE id=?", (b["id"],))
         con.commit()

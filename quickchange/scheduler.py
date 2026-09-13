@@ -407,9 +407,10 @@ def _wear_segments(state, tasks):
                     if run is None:
                         run = {"item_id": iid, "start_scene": sid, "end_scene": sid,
                                "don_task": don_task.get((aid, sid)),
-                               "doff_task": doff_task.get((aid, sid))}
+                               "doff_task": None}
                     else:
                         run["end_scene"] = sid
+                        # 脱下任务是「离开本段最后一场」的换装任务
                         run["doff_task"] = doff_task.get((aid, sid))
                 elif run is not None:
                     segs[(aid, iid)].append(run)
@@ -494,6 +495,22 @@ def _pick_copy(cps, t, release, blocked=frozenset()):
         if best is None or nxt > best[1]:
             best = (idx, nxt)
     return (best[0], False) if best else None
+
+
+def _pinned_gap(cp, t, end):
+    """固定副本日历：最早 t'≥t 使 [t',end) 与该副本已有区间均不冲突；
+    不存在这样的 t'（end 之后仍被占）返回 None。"""
+    cur = t
+    for iv in sorted(cp):
+        if iv[1] <= cur:
+            continue
+        if iv[0] >= end:
+            break
+        cur = iv[1]
+    # cur 之后在 [cur,end) 内不得再有占用
+    if any(iv[0] < end and iv[1] > cur for iv in cp):
+        return None
+    return cur
 
 
 def _overlap(ivs, s, e):
@@ -623,10 +640,11 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
     """
     (_, _, dressers, skills, dresser_sk, dresser_sides,
      unavail, _review_by) = maps
-    # 替演：人工改派副本严格占用 {(task_id,item_id): 副本下标(0起)}；
-    # 自动分配排除的副本 {(task_id,item_id): frozenset(下标)}
+    # 替演：人工/适配选定副本严格占用 {(task_id,item_id): 副本下标(0起)}；
+    # 开场前已穿着段落的固定副本 {(actor_id,item_id,start_scene): 副本下标}
     pin_copy = state.get("_pin_copy") or {}
     block_copies = state.get("_block_copies") or {}
+    init_pin_map = state.get("_init_pins") or {}
     actor_busy = defaultdict(list)     # actor_id -> [(s,e,task_id)]
     dresser_busy = defaultdict(list)   # dresser_id -> [(s,e,tid,end_pt,key)]
     pos_busy = defaultdict(list)       # position_id -> [(s,e,task_id)]
@@ -659,9 +677,27 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
                 rel = _seg_release(seg, tasks_by_id, scenes, items, doff_actuals)
                 sc = scenes.get(seg["start_scene"])
                 start0 = sc["start_sec"] if sc else 0
+                init_idx = init_pin_map.get((aid, iid, seg["start_scene"]))
+                it = items.get(iid)
+                if init_idx is not None and init_idx < len(copies[iid]):
+                    # 替演：开场前已穿着段固定到适配选定副本，不换件；
+                    # rel 随定点迭代（实际脱下顺延）更新，保持无交叠
+                    cp = copies[iid][init_idx]
+                    busy_iv = next((iv for iv in cp if iv[0] < rel and iv[1] > start0), None)
+                    if busy_iv is not None:
+                        conflicts.append({
+                            "type": "copy_pin", "task_id": seg.get("doff_task") or 0,
+                            "time": start0,
+                            "message": f"缺件：{it['name'] if it else iid} 开场穿着选定的"
+                                       f"副本#{init_idx + 1}在 {fmt(max(start0, busy_iv[0]))} "
+                                       f"被并发占用（{busy_iv[2]}），无替代副本"})
+                        continue
+                    iv = [start0, rel, f"init:a{aid}"]
+                    cp.append(iv)
+                    worn[(aid, iid)] = (init_idx, iv)
+                    continue
                 pick = _pick_copy(copies[iid], start0, rel)
                 if pick is None or not pick[1]:
-                    it = items.get(iid)
                     conflicts.append({
                         "type": "item", "task_id": 0, "time": start0,
                         "message": f"缺件：{it['name'] if it else iid} 开场穿着无可用副本（副本不足）"})
@@ -702,19 +738,32 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
                     pin_idx = pin_copy.get((tid, iid))
                     blocked = block_copies.get((tid, iid)) or frozenset()
                     if pin_idx is not None and pin_idx < len(copies.get(iid, [])):
-                        # 人工改派：严格占用指定副本，不等待、不顺延，被占即冲突
+                        # 固定副本（适配选定/人工改派）：只等这一件，不换别的副本。
+                        # 该件全程不可得 → copy_pin 冲突且不分配；可复用等待 → 顺延。
                         cp = copies[iid][pin_idx]
-                        busy_iv = next((iv for iv in cp if iv[0] < rel and iv[1] > cur), None)
-                        if busy_iv is not None:
-                            note = {
-                                "type": "copy_pin", "task_id": tid, "action_idx": ai,
-                                "time": cur, "action_label": a["label"],
-                                "message": f"{a['label']}：人工改派副本#{pin_idx + 1}在 "
-                                           f"{fmt(max(cur, busy_iv[0]))} 已被占用"
-                                           f"（{busy_iv[2]}），改派冲突"}
+                        t1 = _pinned_gap(cp, cur, rel)
+                        if t1 is None:
+                            busy_iv = next((iv for iv in cp
+                                           if iv[0] < rel and iv[1] > cur), None)
+                            msg = (f"缺件：{a['label']} 选定的副本#{pin_idx + 1}穿着期间"
+                                   f"被并发占用（{(busy_iv[2] if busy_iv else '其他占用')}），"
+                                   f"无替代副本")
+                            note = {"type": "copy_pin", "task_id": tid, "action_idx": ai,
+                                    "time": cur, "action_label": a["label"], "message": msg}
                             item_wait_notes.append(note)
                             if record_root:
                                 root_item_notes.append(note)
+                        elif t1 > cur:
+                            why = "清洁/维修中" if it and it["status"] != "ok" \
+                                else f"复用等待（副本#{pin_idx + 1}前一位尚未脱下）"
+                            item_wait_notes.append({
+                                "type": "item", "task_id": tid, "action_idx": ai,
+                                "time": t1,
+                                "message": f"缺件/复用冲突：{a['label']} 选定副本"
+                                           f"#{pin_idx + 1} 需等到 {fmt(t1)}（{why}）"})
+                            a["start"] = t1
+                            if record_root:
+                                root_item_notes.append(item_wait_notes[-1])
                     else:
                         t1 = _copy_gap_abs(copies[iid], cur, rel, blocked=blocked)
                         if t1 is None:
