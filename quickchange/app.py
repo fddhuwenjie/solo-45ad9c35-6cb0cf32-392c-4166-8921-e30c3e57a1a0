@@ -13,6 +13,7 @@ from flask import Flask, Response, jsonify, render_template, request
 import db
 import rehearsal
 import scheduler
+import understudy
 
 app = Flask(__name__)
 PID = 1
@@ -23,7 +24,7 @@ FIELDS = {
     "actors": ["name", "code", "default_side"],
     "looks": ["actor_id", "scene_id", "name"],
     "items": ["name", "kind", "layer", "don_sec", "doff_sec", "status",
-              "available_at", "cart_id", "copies", "skill_id"],
+              "available_at", "cart_id", "copies", "skill_id", "closure"],
     "dressers": ["name"],
     "skills": ["name"],
     "positions": ["name", "side", "x", "y", "capacity"],
@@ -35,10 +36,12 @@ FIELDS = {
 
 
 def full_state():
+    db.sync_item_copies(PID)
     state = db.load_state(PID)
     sched = scheduler.compute_schedule(state)
     state["schedule"] = sched
     state["runs"] = db.list_runs(PID)
+    state["understudy_branches"] = db.list_branches(PID)
     return state
 
 
@@ -434,6 +437,8 @@ def api_update(entity, rid):
                 JOIN look_items li2 ON li2.look_id=l2.id AND li2.item_id=?
             """, (rid, rid)).fetchall()]
             _mark_action_review(con, tids, "服装/道具变更")
+            # 替演分支：只标记基准快照含该服装的相关分支待复核
+            db.mark_understudy_dirty(PID, item_ids=[rid])
         con.commit()
     finally:
         con.close()
@@ -622,6 +627,553 @@ def api_run_derive():
     out = full_state()
     out["derived"] = result
     return jsonify(out)
+
+
+# ---------------- 替演推演 ----------------
+
+def _branch_inputs(br):
+    """读取分支的卡司/改派/备注/改衣开工时刻。"""
+    return (json.loads(br["cast_json"] or "{}"),
+            json.loads(br["assigns_json"] or "{}"),
+            json.loads(br["notes_json"] or "{}"),
+            int(br.get("alter_start_sec") or 0))
+
+
+def _branch_base(br):
+    """分支推演用 state：基准修订快照 + 当前尺寸/副本/适配资料。"""
+    state = db.load_state(PID)
+    rev = db.get_revision(br["revision_id"])
+    if not rev:
+        return None
+    return understudy.base_state_for(state, rev)
+
+
+def _branch_detail(br):
+    plan = understudy.parse_plan(br)
+    return {"branch": {k: br[k] for k in
+                       ("id", "revision_id", "name", "status", "needs_review",
+                        "created_at", "confirmed_at", "alter_start_sec")},
+            "cast": json.loads(br["cast_json"] or "{}"),
+            "assigns": json.loads(br["assigns_json"] or "{}"),
+            "notes": json.loads(br["notes_json"] or "{}"),
+            "plan": plan}
+
+
+def _recompute(br):
+    """按分支输入重算并落盘（仅草稿）；返回 detail。"""
+    base = _branch_base(br)
+    if base is None:
+        return None
+    cast, assigns, notes, alter_start = _branch_inputs(br)
+    plan = understudy.build_branch(base, cast, assigns, notes, alter_start)
+    db.update_branch(br["id"], plan=plan)
+    return _branch_detail(db.get_branch(br["id"]))
+
+
+@app.get("/api/understudy/branches")
+def api_branch_list():
+    out = []
+    for br in db.list_branches(PID):
+        d = _branch_detail(br)
+        p = d["plan"] or {}
+        out.append({**d["branch"], "n_cast": len(d["cast"]),
+                    "can_confirm": p.get("can_confirm", False),
+                    "n_blocking": p.get("n_blocking", 0),
+                    "earliest": p.get("earliest")})
+    return jsonify({"branches": out})
+
+
+@app.get("/api/understudy/branches/<int:bid>")
+def api_branch_get(bid):
+    br = db.get_branch(bid)
+    if not br:
+        return jsonify({"ok": False, "error": "替演分支不存在"}), 404
+    return jsonify(_branch_detail(br))
+
+
+@app.post("/api/understudy/branches")
+def api_branch_create():
+    """从任一修订开启替演分支：{revision_id, name?, cast?, alter_start_sec?}。"""
+    data = request.get_json(force=True)
+    rev = db.get_revision(int(data.get("revision_id", 0)))
+    if not rev:
+        return jsonify({"ok": False, "error": "基准修订不存在，请先保存修订"}), 404
+    cast = {str(k): int(v) for k, v in (data.get("cast") or {}).items() if v}
+    plan = understudy.build_branch(
+        understudy.base_state_for(db.load_state(PID), rev),
+        cast, {}, {}, int(data.get("alter_start_sec") or 0))
+    name = (data.get("name") or f"替演·修订#{rev['id']}").strip()
+    bid = db.create_branch(rev["id"], name, cast, {}, {},
+                           int(data.get("alter_start_sec") or 0), plan, PID)
+    return jsonify({"ok": True, "id": bid, "detail": _branch_detail(db.get_branch(bid))})
+
+
+@app.post("/api/understudy/branches/<int:bid>/cast")
+def api_branch_cast(bid):
+    """拖换卡司：{task_id, actor_id}（actor_id 空=还原原角）；整体重算。"""
+    br = db.get_branch(bid)
+    if not br:
+        return jsonify({"ok": False, "error": "替演分支不存在"}), 404
+    if br["status"] == "confirmed":
+        return jsonify({"ok": False, "error": "确认版已冻结，不能再拖换卡司"}), 409
+    data = request.get_json(force=True)
+    try:
+        tid, aid = str(int(data["task_id"])), int(data.get("actor_id") or 0)
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"ok": False, "error": "task_id/actor_id 无效"}), 400
+    cast, assigns, notes, alter_start = _branch_inputs(br)
+    if aid:
+        cast[tid] = aid
+    else:
+        cast.pop(tid, None)
+        # 还原原角时清掉该任务的改派/备注
+        for k in [k for k in assigns if k.startswith(tid + ":")]:
+            assigns.pop(k, None)
+        for k in [k for k in notes if k.startswith(tid + ":")]:
+            notes.pop(k, None)
+    db.update_branch(bid, cast=cast, assigns=assigns, notes=notes)
+    detail = _recompute(db.get_branch(bid))
+    return jsonify({"ok": True, "detail": detail, "state": full_state()})
+
+
+@app.post("/api/understudy/branches/<int:bid>/assign")
+def api_branch_assign(bid):
+    """人工改派副本：{task_id,item_id,copy_id(=item_copies.id),note}。
+    边界尺寸/人工改派必须备注：note 为空直接拒绝。"""
+    br = db.get_branch(bid)
+    if not br:
+        return jsonify({"ok": False, "error": "替演分支不存在"}), 404
+    if br["status"] == "confirmed":
+        return jsonify({"ok": False, "error": "确认版已冻结，不能再改派副本"}), 409
+    data = request.get_json(force=True)
+    try:
+        tid, iid, cid = int(data["task_id"]), int(data["item_id"]), int(data["copy_id"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"ok": False, "error": "task_id/item_id/copy_id 无效"}), 400
+    note = (data.get("note") or "").strip()
+    cast, assigns, notes, alter_start = _branch_inputs(br)
+    con = db.connect()
+    try:
+        row = con.execute("SELECT id FROM item_copies WHERE id=? AND item_id=?",
+                          (cid, iid)).fetchone()
+    finally:
+        con.close()
+    if not row:
+        return jsonify({"ok": False, "error": "该副本不属于所选服装"}), 400
+    key = f"{tid}:{iid}"
+    assigns[key] = cid
+    if note:
+        notes[key] = note
+    elif not (notes.get(key) or "").strip():
+        return jsonify({"ok": False,
+                        "error": "人工改派副本必须填写备注（理由/边界尺寸）"}), 400
+    db.update_branch(bid, assigns=assigns, notes=notes)
+    detail = _recompute(db.get_branch(bid))
+    return jsonify({"ok": True, "detail": detail, "state": full_state()})
+
+
+@app.post("/api/understudy/branches/<int:bid>/note")
+def api_branch_note(bid):
+    """登记/修改适配备注：{task_id,item_id,note}（清空=删除）。"""
+    br = db.get_branch(bid)
+    if not br:
+        return jsonify({"ok": False, "error": "替演分支不存在"}), 404
+    if br["status"] == "confirmed":
+        return jsonify({"ok": False, "error": "确认版已冻结，备注不可修改"}), 409
+    data = request.get_json(force=True)
+    key = f"{int(data['task_id'])}:{int(data['item_id'])}"
+    cast, assigns, notes, alter_start = _branch_inputs(br)
+    note = (data.get("note") or "").strip()
+    if note:
+        notes[key] = note
+    else:
+        notes.pop(key, None)
+    db.update_branch(bid, notes=notes)
+    detail = _recompute(db.get_branch(bid))
+    return jsonify({"ok": True, "detail": detail, "state": full_state()})
+
+
+@app.post("/api/understudy/branches/<int:bid>/alter_start")
+def api_branch_alter_start(bid):
+    """设置改衣可开始的演出时钟时刻（秒）。"""
+    br = db.get_branch(bid)
+    if not br:
+        return jsonify({"ok": False, "error": "替演分支不存在"}), 404
+    if br["status"] == "confirmed":
+        return jsonify({"ok": False, "error": "确认版已冻结"}), 409
+    sec = int((request.get_json(force=True) or {}).get("alter_start_sec") or 0)
+    db.update_branch(bid, alter_start_sec=sec)
+    detail = _recompute(db.get_branch(bid))
+    return jsonify({"ok": True, "detail": detail, "state": full_state()})
+
+
+@app.post("/api/understudy/branches/<int:bid>/recompute")
+def api_branch_recompute(bid):
+    """资料变化后手动重新推演（草稿）；已确认版只返回冻结计划。"""
+    br = db.get_branch(bid)
+    if not br:
+        return jsonify({"ok": False, "error": "替演分支不存在"}), 404
+    if br["status"] == "confirmed":
+        return jsonify({"ok": True, "detail": _branch_detail(br), "frozen": True})
+    detail = _recompute(br)
+    if detail is None:
+        return jsonify({"ok": False, "error": "基准修订不存在"}), 400
+    db.update_branch(bid, needs_review=False)
+    detail = _branch_detail(db.get_branch(bid))
+    return jsonify({"ok": True, "detail": detail, "state": full_state()})
+
+
+@app.post("/api/understudy/branches/<int:bid>/clear_review")
+def api_branch_clear_review(bid):
+    br = db.get_branch(bid)
+    if not br:
+        return jsonify({"ok": False, "error": "替演分支不存在"}), 404
+    db.update_branch(bid, needs_review=False)
+    return jsonify({"ok": True, "detail": _branch_detail(db.get_branch(bid))})
+
+
+@app.post("/api/understudy/branches/<int:bid>/confirm")
+def api_branch_confirm(bid):
+    """确认版冻结：卡司、适配决定、受影响任务。存在任一阻断（含未备注决定）
+    时禁止确认。"""
+    br = db.get_branch(bid)
+    if not br:
+        return jsonify({"ok": False, "error": "替演分支不存在"}), 404
+    if br["status"] == "confirmed":
+        return jsonify({"ok": False, "error": "该分支已是确认版"}), 409
+    detail = _recompute(br)
+    if detail is None:
+        return jsonify({"ok": False, "error": "基准修订不存在"}), 400
+    plan = detail["plan"]
+    if not plan.get("can_confirm"):
+        e = plan.get("earliest") or {}
+        return jsonify({"ok": False,
+                        "error": f"尚有阻断未解决，不能确认：[{scheduler.fmt(e.get('time', 0))}] "
+                                 f"{e.get('message', '')}"}), 409
+    db.confirm_branch(bid, plan)
+    return jsonify({"ok": True, "detail": _branch_detail(db.get_branch(bid)),
+                    "state": full_state()})
+
+
+@app.delete("/api/understudy/branches/<int:bid>")
+def api_branch_delete(bid):
+    br = db.get_branch(bid)
+    if not br:
+        return jsonify({"ok": False, "error": "替演分支不存在"}), 404
+    if br["status"] == "confirmed":
+        return jsonify({"ok": False, "error": "确认版已冻结，不能删除"}), 409
+    db.delete_branch(bid)
+    return jsonify({"ok": True, "state": full_state()})
+
+
+# ---------------- 替演资料登记 ----------------
+
+@app.post("/api/actors/<int:aid>/measures")
+def api_actor_measures(aid):
+    """演员关键尺寸（身高/胸围/腰围/臀围/肩宽/脚长，厘米）。变化时标记相关分支。"""
+    data = request.get_json(force=True)
+    con = db.connect()
+    try:
+        if not con.execute("SELECT 1 FROM actors WHERE id=? AND production_id=?",
+                           (aid, PID)).fetchone():
+            return jsonify({"ok": False, "error": "演员不存在"}), 404
+        row = con.execute("SELECT * FROM actor_measures WHERE actor_id=?", (aid,)).fetchone()
+        vals = {k: (float(data[k]) if data.get(k) not in (None, "") else None)
+                for k in ("height", "chest", "waist", "hip", "shoulder", "foot")
+                if k in data}
+        if row is None:
+            cols = ["production_id", "actor_id", "updated_at"] + list(vals)
+            qs = ",".join("?" for _ in cols)
+            con.execute(f"INSERT INTO actor_measures({','.join(cols)}) VALUES({qs})",
+                        [PID, aid, time.time()] + list(vals.values()))
+        else:
+            sets = [f"{k}=?" for k in vals]
+            con.execute(f"UPDATE actor_measures SET {','.join(sets)}, updated_at=? "
+                        "WHERE actor_id=?", list(vals.values()) + [time.time(), aid])
+        con.commit()
+    finally:
+        con.close()
+    db.mark_understudy_dirty(PID, actor_ids=[aid])
+    return jsonify(full_state())
+
+
+@app.post("/api/understudy/roster")
+def api_roster_set():
+    """登记角色候补顺位：{role_actor_id, under_actor_id, priority}。"""
+    data = request.get_json(force=True)
+    try:
+        role, under, prio = int(data["role_actor_id"]), int(data["under_actor_id"]), \
+            int(data.get("priority") or 1)
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"ok": False, "error": "参数无效"}), 400
+    con = db.connect()
+    try:
+        ids = {r["id"] for r in con.execute(
+            "SELECT id FROM actors WHERE production_id=?", (PID,)).fetchall()}
+        if role not in ids or under not in ids:
+            return jsonify({"ok": False, "error": "演员不存在"}), 400
+        con.execute(
+            "INSERT INTO understudy_roster(production_id,role_actor_id,under_actor_id,priority) "
+            "VALUES(?,?,?,?) ON CONFLICT(production_id,role_actor_id,under_actor_id) "
+            "DO UPDATE SET priority=excluded.priority", (PID, role, under, prio))
+        con.commit()
+    finally:
+        con.close()
+    return jsonify(full_state())
+
+
+@app.delete("/api/understudy/roster/<int:rid>")
+def api_roster_delete(rid):
+    con = db.connect()
+    try:
+        con.execute("DELETE FROM understudy_roster WHERE id=? AND production_id=?", (rid, PID))
+        con.commit()
+    finally:
+        con.close()
+    return jsonify(full_state())
+
+
+@app.post("/api/item_copies/<int:cid>")
+def api_copy_update(cid):
+    """实物副本：标签、闭合件类型（''=服装默认）。"""
+    data = request.get_json(force=True)
+    con = db.connect()
+    try:
+        row = con.execute("SELECT * FROM item_copies WHERE id=? AND production_id=?",
+                          (cid, PID)).fetchone()
+        if not row:
+            return jsonify({"ok": False, "error": "副本不存在"}), 404
+        sets, args = [], []
+        if "label" in data:
+            sets.append("label=?")
+            args.append(str(data["label"]))
+        if "closure" in data:
+            cl = str(data.get("closure") or "")
+            if cl and cl not in understudy.CLOSURE_EXTRA:
+                return jsonify({"ok": False, "error": "闭合件类型无效"}), 400
+            sets.append("closure=?")
+            args.append(cl)
+        if sets:
+            con.execute(f"UPDATE item_copies SET {','.join(sets)} WHERE id=?", args + [cid])
+            con.commit()
+            iid = row["item_id"]
+    finally:
+        con.close()
+    db.mark_understudy_dirty(PID, item_ids=[iid])
+    return jsonify(full_state())
+
+
+@app.post("/api/item_copies/<int:cid>/fit")
+def api_copy_fit(cid):
+    """副本适配区间：{dim, lo, hi, alterable, alter_sec}；hi 空=删除该部位区间。"""
+    data = request.get_json(force=True)
+    dim = data.get("dim")
+    if dim not in understudy.DIM_KEYS:
+        return jsonify({"ok": False, "error": "部位无效"}), 400
+    con = db.connect()
+    try:
+        row = con.execute("SELECT * FROM item_copies WHERE id=? AND production_id=?",
+                          (cid, PID)).fetchone()
+        if not row:
+            return jsonify({"ok": False, "error": "副本不存在"}), 404
+        if data.get("hi") in (None, "") or data.get("lo") in (None, ""):
+            con.execute("DELETE FROM copy_fit WHERE copy_id=? AND dim=?", (cid, dim))
+        else:
+            lo, hi = float(data["lo"]), float(data["hi"])
+            if hi < lo:
+                return jsonify({"ok": False, "error": "适配上限不能小于下限"}), 400
+            alt = 1 if data.get("alterable") else 0
+            alt_sec = max(0, int(data.get("alter_sec") or 0))
+            con.execute(
+                "INSERT INTO copy_fit(production_id,copy_id,dim,lo,hi,alterable,alter_sec) "
+                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(copy_id,dim) DO UPDATE SET "
+                "lo=excluded.lo,hi=excluded.hi,alterable=excluded.alterable,"
+                "alter_sec=excluded.alter_sec",
+                (PID, cid, dim, lo, hi, alt, alt_sec))
+        con.commit()
+        iid = row["item_id"]
+    finally:
+        con.close()
+    db.mark_understudy_dirty(PID, item_ids=[iid])
+    return jsonify(full_state())
+
+
+@app.get("/export/understudy/<int:bid>/sheet")
+def export_understudy_sheet(bid):
+    """替演换装单（HTML，可打印）：冻结卡司、适配决定、改衣、逐任务动作。"""
+    br = db.get_branch(bid)
+    if not br:
+        return "替演分支不存在", 404
+    detail = _branch_detail(br)
+    plan = detail["plan"]
+    if not plan:
+        return "分支尚未推演", 400
+    state = _branch_base(br)
+    actors = {a["id"]: a for a in state["actors"]}
+    scenes = {s["id"]: s for s in state["scenes"]}
+    items = {i["id"]: i for i in state["items"]}
+    positions = {p["id"]: p for p in state["positions"]}
+    dressers = {d["id"]: d for d in state["dressers"]}
+    orig_tasks = {t["id"]: t for t in state["tasks"]}
+    cast = {int(k): v for k, v in plan["cast"].items()}
+    rows = []
+    for tid in sorted(cast, key=lambda x: plan["windows"].get(str(x), {}).get("start", 0)):
+        w = plan["windows"].get(str(tid))
+        ot = orig_tasks.get(tid)
+        if not w or not ot:
+            continue
+        fs, ts = scenes.get(ot["from_scene_id"]), scenes.get(ot["to_scene_id"])
+        pos = positions.get(ot["position_id"])
+        acts = sorted((a for a in plan["actions"] if a["task_id"] == tid),
+                      key=lambda a: a["action_idx"])
+        parts = []
+        for a in acts:
+            who = "、".join(dressers[d]["name"] for d in a["staff_ids"] if d in dressers)
+            parts.append(f"{a['label']}({a['dur']}s" + (f"·{who}" if who else "") + ")")
+        rows.append(
+            f"<tr><td>{scheduler.fmt(w['start'])}</td>"
+            f"<td>#{tid} {actors.get(cast[tid], {}).get('name', '?')}"
+            f"<span class=sub>（替 {actors.get(ot['actor_id'], {}).get('name', '?')}）</span></td>"
+            f"<td>{fs['name'] if fs else ''} → {ts['name'] if ts else ''}</td>"
+            f"<td>{pos['name'] if pos else '-'}</td>"
+            f"<td>{scheduler.fmt(w['deadline'])}</td>"
+            f"<td class=acts>{' → '.join(parts)}</td>"
+            f"<td>{'按时' if w['ok'] else '<b class=bad>超时</b>'}</td></tr>")
+    fit_rows = "".join(
+        f"<tr><td>#{f['task_id']}</td><td>{f['actor_name']}</td>"
+        f"<td>{items[f['item_id']]['name'] if f['item_id'] in items else f['item_id']}</td>"
+        f"<td>第{f['copy_no']}件</td><td><b class='{f['status']}'>{f['status']}</b></td>"
+        f"<td>{'、'.join(understudy.dim_cn(d) for d in f['boundary']) or '-'}</td>"
+        f"<td>{detail['notes'].get(str(f['task_id'])+':'+str(f['item_id']), '')}</td></tr>"
+        for f in plan["fit_rows"])
+    dec_rows = "".join(
+        f"<li>{d['reason']}"
+        + (f"｜改衣最晚 {scheduler.fmt(d['latest_alter_start'])} 开工"
+           if d["kind"] == "alter" and "latest_alter_start" in d else "")
+        + (f"｜备注：{detail['notes'].get(str(d['task_id'])+':'+str(d['item_id']), '')}" or "")
+        + "</li>" for d in plan["decisions"]) or "<li>无</li>"
+    conf_rows = "".join(
+        f"<li>[{scheduler.fmt(c['time'])}] 任务#{c['task_id']} {c['message']}</li>"
+        for c in plan["conflicts"]) or "<li>无 ✓</li>"
+    status = "已确认（冻结）" if br["status"] == "confirmed" else "草稿"
+    html = f"""<!doctype html><html lang=zh><meta charset=utf-8>
+<title>替演换装单 · {_xml(br['name'])}</title>
+<style>body{{font-family:sans-serif;margin:22px}}table{{border-collapse:collapse;width:100%;margin:8px 0}}
+td,th{{border:1px solid #999;padding:5px 8px;font-size:12px;vertical-align:top}}
+h1{{font-size:19px}}h2{{font-size:15px;margin-top:18px}}.sub{{color:#888;font-size:11px}}
+.bad{{color:#c0392b}}.合身{{color:#27ae60}}.需改衣{{color:#b9770e}}.越界{{color:#c0392b}}
+.acts{{font-size:11px;color:#555}}</style>
+<h1>替演换装单 · {_xml(br['name'])}</h1>
+<p>基准修订 #{br['revision_id']}｜状态：{status}｜改衣可开工 {scheduler.fmt(plan['alter_start_sec'])}
+｜{'可确认 ✓' if plan['can_confirm'] else '<b class=bad>有阻断，未确认</b>'}</p>
+<h2>换装任务（冻结卡司与分工）</h2>
+<table><tr><th>开始</th><th>候补演员</th><th>场次</th><th>换装位</th><th>开场截止</th>
+<th>动作顺序</th><th>结果</th></tr>{''.join(rows)}</table>
+<h2>副本适配决定</h2>
+<table><tr><th>任务</th><th>候补</th><th>服装</th><th>副本</th><th>判定</th>
+<th>边界部位</th><th>备注</th></tr>{fit_rows}</table>
+<h2>改衣/边界/人工改派</h2><ul>{dec_rows}</ul>
+<h2>冲突（冻结时状态）</h2><ul>{conf_rows}</ul>"""
+    return html
+
+
+def _understudy_diff_svg(br, plan, state, dl=False):
+    """原计划 vs 替演 叠放 SVG：受影响演员泳道内上原下替，标出冲突与截止。"""
+    import json as _json
+    rev = db.get_revision(br["revision_id"])
+    snap = _json.loads(rev["snapshot"])
+    orig_state = understudy.base_state_for(state, rev)
+    orig_sched = scheduler.compute_schedule(orig_state)
+    scenes = state["scenes"]
+    cast = {int(k): v for k, v in plan["cast"].items()}
+    orig_tasks = {t["id"]: t for t in snap["tasks"]}
+    actor_ids = sorted({cast[tid] for tid in cast} |
+                       {orig_tasks[tid]["actor_id"] for tid in cast if tid in orig_tasks})
+    actors = {a["id"]: a for a in state["actors"]}
+    total = max((s["start_sec"] + s["duration_sec"] for s in scenes), default=600) + 60
+    scale = 900.0 / max(total, 1)
+    lane_h, top = 52, 34
+    h = top + lane_h * max(1, len(actor_ids)) + 46
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="960" height="{h}" '
+             f'font-family="sans-serif" font-size="11">',
+             f'<rect width="960" height="{h}" fill="#fff"/>']
+    for s in scenes:
+        x = 40 + s["start_sec"] * scale
+        parts.append(f'<rect x="{x:.1f}" y="8" width="{s["duration_sec"]*scale:.1f}" '
+                     f'height="14" fill="#dde6f2"/>')
+        parts.append(f'<text x="{x+2:.1f}" y="19" fill="#334">{_xml(s["name"])}</text>')
+    for i, aid in enumerate(actor_ids):
+        y = top + i * lane_h
+        parts.append(f'<text x="2" y="{y+26}">{_xml(actors.get(aid, {}).get("name", "#"+str(aid)))}</text>')
+        parts.append(f'<line x1="40" y1="{y+lane_h}" x2="950" y2="{y+lane_h}" stroke="#eee"/>')
+
+    def bar(tid, w, y, color, label):
+        x = 40 + w["start"] * scale
+        wdt = max(3, (w["end"] - w["start"]) * scale)
+        parts.append(f'<rect x="{x:.1f}" y="{y}" width="{wdt:.1f}" height="13" rx="2" '
+                     f'fill="{color}" opacity="0.9"/>')
+        parts.append(f'<text x="{x+2:.1f}" y="{y+10}" fill="#fff" font-size="9">'
+                     f'#{tid}{label}</text>')
+        dx = 40 + w["deadline"] * scale
+        parts.append(f'<line x1="{dx:.1f}" y1="{y-2}" x2="{dx:.1f}" y2="{y+17}" '
+                     f'stroke="#c0392b" stroke-dasharray="3 2"/>')
+
+    for i, aid in enumerate(actor_ids):
+        y = top + i * lane_h
+        # 原计划：该演员（原角）的任务在上排
+        for tid, ot in orig_tasks.items():
+            if ot["actor_id"] != aid:
+                continue
+            w = orig_sched["windows"].get(tid)
+            if w:
+                bar(tid, w, y + 4, "#7f8c8d", "原")
+        # 替演：候补承担的任务在下排
+        for tid, ua in cast.items():
+            if ua != aid:
+                continue
+            w = plan["windows"].get(str(tid))
+            if w:
+                color = "#c0392b" if not w["ok"] else "#8e44ad"
+                bar(tid, w, y + 21, color, "替")
+    for c in plan["conflicts"]:
+        aid = cast.get(c["task_id"], 0)
+        if aid not in actor_ids:
+            continue
+        y = top + actor_ids.index(aid) * lane_h
+        x = 40 + c["time"] * scale
+        parts.append(f'<path d="M{x:.1f},{y+40} l4,-6 l4,6 z" fill="#e74c3c"/>')
+    ly = h - 28
+    parts.append(f'<rect x="40" y="{ly}" width="12" height="12" fill="#7f8c8d"/>'
+                 f'<text x="56" y="{ly+10}">原计划</text>'
+                 f'<rect x="110" y="{ly}" width="12" height="12" fill="#8e44ad"/>'
+                 f'<text x="126" y="{ly+10}">替演(按时)</text>'
+                 f'<rect x="200" y="{ly}" width="12" height="12" fill="#c0392b"/>'
+                 f'<text x="216" y="{ly+10}">替演(超时)</text>'
+                 f'<path d="M300,{ly+12} l4,-7 l4,7 z" fill="#e74c3c"/>'
+                 f'<text x="312" y="{ly+10}">冲突</text>')
+    parts.append(f'<text x="40" y="{h-8}" fill="#888" font-size="10">'
+                 f'{_xml(br["name"])} · 基准修订#{br["revision_id"]}</text>')
+    parts.append("</svg>")
+    svg = "".join(parts)
+    if dl:
+        return Response(svg, mimetype="image/svg+xml",
+                        headers={"Content-Disposition":
+                                 f"attachment; filename=understudy{bid}_diff.svg"})
+    return Response(svg, mimetype="image/svg+xml")
+
+
+@app.get("/export/understudy/<int:bid>/diff.svg")
+def export_understudy_diff(bid):
+    """原计划—替演差异 SVG（叠放）。"""
+    br = db.get_branch(bid)
+    if not br:
+        return "替演分支不存在", 404
+    plan = understudy.parse_plan(br)
+    if not plan:
+        return "分支尚未推演", 400
+    state = db.load_state(PID)
+    return _understudy_diff_svg(br, plan, state,
+                                dl=bool(request.args.get("dl")))
 
 
 # ---------------- 导出 ----------------

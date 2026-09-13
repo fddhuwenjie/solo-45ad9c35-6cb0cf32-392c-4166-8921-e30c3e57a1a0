@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS items(
   available_at INTEGER NOT NULL DEFAULT 0,   -- 清洁/维修后可用的演出时刻(秒)
   cart_id INTEGER,
   copies INTEGER NOT NULL DEFAULT 1,
-  skill_id INTEGER               -- 该服装穿/脱动作的默认所需技能
+  skill_id INTEGER,              -- 该服装穿/脱动作的默认所需技能
+  closure TEXT NOT NULL DEFAULT 'zip'  -- 默认闭合件：zip拉链|hook钩扣|tie系带|frog盘扣
 );
 CREATE TABLE IF NOT EXISTS look_items(
   look_id INTEGER NOT NULL,
@@ -182,6 +183,63 @@ CREATE TABLE IF NOT EXISTS run_events(
   copy_id INTEGER,               -- 现场实际使用的副本编号（NULL=未指定）
   created_at REAL NOT NULL
 );
+
+-- ---------------- 替演推演 ----------------
+-- 演员关键尺寸（厘米）：候补能否穿下原角副本、穿脱加时都据此计算
+CREATE TABLE IF NOT EXISTS actor_measures(
+  production_id INTEGER NOT NULL,
+  actor_id INTEGER NOT NULL,
+  height REAL, chest REAL, waist REAL, hip REAL, shoulder REAL, foot REAL,
+  updated_at REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY(production_id, actor_id)
+);
+-- 角色候补顺位：role_actor_id=原角演员，under_actor_id=候补，priority 小者优先
+CREATE TABLE IF NOT EXISTS understudy_roster(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL,
+  role_actor_id INTEGER NOT NULL,
+  under_actor_id INTEGER NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 1,
+  UNIQUE(production_id, role_actor_id, under_actor_id)
+);
+-- 服装实物副本：闭合件类型可与服装默认不同（拉链/钩扣/系带/盘扣）
+CREATE TABLE IF NOT EXISTS item_copies(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL,
+  item_id INTEGER NOT NULL,
+  copy_no INTEGER NOT NULL,        -- 1 起，与 items.copies 对应
+  label TEXT NOT NULL DEFAULT '',
+  closure TEXT NOT NULL DEFAULT '',-- '' = 用 items.closure 默认值
+  UNIQUE(production_id, item_id, copy_no)
+);
+-- 副本适配区间：每个可调部位一行；alterable=可改衣，alter_sec=改衣耗时
+CREATE TABLE IF NOT EXISTS copy_fit(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL DEFAULT 1,
+  copy_id INTEGER NOT NULL,
+  dim TEXT NOT NULL,               -- height|chest|waist|hip|shoulder|foot
+  lo REAL NOT NULL,
+  hi REAL NOT NULL,
+  alterable INTEGER NOT NULL DEFAULT 0,
+  alter_sec INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(copy_id, dim)
+);
+-- 替演分支：从某修订拖换卡司试算；draft 可改，confirmed 冻结
+CREATE TABLE IF NOT EXISTS understudy_branches(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL,
+  revision_id INTEGER NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'draft',   -- draft | confirmed
+  cast_json TEXT NOT NULL DEFAULT '{}',   -- {task_id: under_actor_id}
+  assigns_json TEXT NOT NULL DEFAULT '{}',-- {"task_id:item_id": copy_id} 人工改派
+  notes_json TEXT NOT NULL DEFAULT '{}',  -- {"task_id:item_id": 备注}
+  alter_start_sec INTEGER NOT NULL DEFAULT 0, -- 改衣可开始的演出时钟时刻
+  plan_json TEXT,                         -- 最近一次推演（确认后冻结）
+  needs_review INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL,
+  confirmed_at REAL
+);
 """
 
 
@@ -198,6 +256,8 @@ def _migrate(con):
     icols = {r["name"] for r in con.execute("PRAGMA table_info(items)")}
     if icols and "skill_id" not in icols:
         con.execute("ALTER TABLE items ADD COLUMN skill_id INTEGER")
+    if icols and "closure" not in icols:
+        con.execute("ALTER TABLE items ADD COLUMN closure TEXT NOT NULL DEFAULT 'zip'")
     con.commit()
 
 
@@ -253,6 +313,14 @@ def load_state(production_id=1):
             "positions": rows(con, "SELECT * FROM positions WHERE production_id=?", (pid,)),
             "carts": rows(con, "SELECT * FROM carts WHERE production_id=?", (pid,)),
             "tasks": rows(con, "SELECT * FROM tasks WHERE production_id=? ORDER BY id", (pid,)),
+            "actor_measures": rows(con, "SELECT * FROM actor_measures WHERE production_id=?", (pid,)),
+            "understudy_roster": rows(con,
+                "SELECT * FROM understudy_roster WHERE production_id=? ORDER BY role_actor_id,priority,id",
+                (pid,)),
+            "item_copies": rows(con, "SELECT * FROM item_copies WHERE production_id=? ORDER BY item_id,copy_no", (pid,)),
+            "copy_fit": rows(con,
+                "SELECT cf.* FROM copy_fit cf JOIN item_copies ic ON ic.id=cf.copy_id "
+                "WHERE ic.production_id=? ORDER BY cf.copy_id,cf.dim", (pid,)),
             "revisions": rows(con, "SELECT id,production_id,created_at,note FROM revisions WHERE production_id=? ORDER BY id DESC", (pid,)),
         }
         look_ids = {l["id"] for l in state["looks"]}
@@ -302,6 +370,14 @@ def snapshot(production_id=1):
                 "SELECT * FROM action_reviews WHERE production_id=? ORDER BY id", (pid,)),
             "positions": rows(con, "SELECT * FROM positions WHERE production_id=?", (pid,)),
             "carts": rows(con, "SELECT * FROM carts WHERE production_id=?", (pid,)),
+            "actor_measures": rows(con, "SELECT * FROM actor_measures WHERE production_id=?", (pid,)),
+            "understudy_roster": rows(con,
+                "SELECT * FROM understudy_roster WHERE production_id=? ORDER BY role_actor_id,priority,id",
+                (pid,)),
+            "item_copies": rows(con, "SELECT * FROM item_copies WHERE production_id=? ORDER BY item_id,copy_no", (pid,)),
+            "copy_fit": rows(con,
+                "SELECT cf.* FROM copy_fit cf JOIN item_copies ic ON ic.id=cf.copy_id "
+                "WHERE ic.production_id=? ORDER BY cf.copy_id,cf.dim", (pid,)),
         }
     finally:
         con.close()
@@ -459,3 +535,144 @@ def run_events(run_id):
         return rows(con, "SELECT * FROM run_events WHERE run_id=? ORDER BY id", (run_id,))
     finally:
         con.close()
+
+
+# ---------------- 替演推演 ----------------
+
+def sync_item_copies(pid=1):
+    """按 items.copies 物化实物副本行（新增补齐；件数减少不删行，保留适配资料）。"""
+    con = connect()
+    try:
+        items = rows(con, "SELECT id, copies FROM items WHERE production_id=?", (pid,))
+        for it in items:
+            have = {r["copy_no"] for r in con.execute(
+                "SELECT copy_no FROM item_copies WHERE item_id=?", (it["id"],))}
+            for n in range(1, max(1, int(it["copies"])) + 1):
+                if n not in have:
+                    con.execute(
+                        "INSERT INTO item_copies(production_id,item_id,copy_no,label,closure) "
+                        "VALUES(?,?,?,'','')", (pid, it["id"], n))
+        con.commit()
+    finally:
+        con.close()
+
+
+def list_branches(pid=1):
+    con = connect()
+    try:
+        return rows(con,
+            "SELECT id,production_id,revision_id,name,status,needs_review,created_at,confirmed_at "
+            "FROM understudy_branches WHERE production_id=? ORDER BY id DESC", (pid,))
+    finally:
+        con.close()
+
+
+def get_branch(branch_id):
+    con = connect()
+    try:
+        return row(con, "SELECT * FROM understudy_branches WHERE id=?", (branch_id,))
+    finally:
+        con.close()
+
+
+def create_branch(revision_id, name, cast, assigns, notes, alter_start_sec, plan, pid=1):
+    con = connect()
+    try:
+        cur = con.execute(
+            "INSERT INTO understudy_branches(production_id,revision_id,name,status,cast_json,"
+            "assigns_json,notes_json,alter_start_sec,plan_json,needs_review,created_at) "
+            "VALUES(?,?,?,'draft',?,?,?,?,?,0,?)",
+            (pid, revision_id, name,
+             json.dumps(cast, ensure_ascii=False), json.dumps(assigns, ensure_ascii=False),
+             json.dumps(notes, ensure_ascii=False), int(alter_start_sec or 0),
+             json.dumps(plan, ensure_ascii=False) if plan is not None else None,
+             time.time()))
+        con.commit()
+        return cur.lastrowid
+    finally:
+        con.close()
+
+
+def update_branch(branch_id, cast=None, assigns=None, notes=None,
+                  alter_start_sec=None, plan=None, needs_review=None):
+    """整体更新草稿分支的试算输入与最近一次推演结果。"""
+    sets, args = [], []
+    if cast is not None:
+        sets.append("cast_json=?")
+        args.append(json.dumps(cast, ensure_ascii=False))
+    if assigns is not None:
+        sets.append("assigns_json=?")
+        args.append(json.dumps(assigns, ensure_ascii=False))
+    if notes is not None:
+        sets.append("notes_json=?")
+        args.append(json.dumps(notes, ensure_ascii=False))
+    if alter_start_sec is not None:
+        sets.append("alter_start_sec=?")
+        args.append(int(alter_start_sec))
+    if plan is not None:
+        sets.append("plan_json=?")
+        args.append(json.dumps(plan, ensure_ascii=False))
+    if needs_review is not None:
+        sets.append("needs_review=?")
+        args.append(1 if needs_review else 0)
+    if not sets:
+        return
+    con = connect()
+    try:
+        con.execute(f"UPDATE understudy_branches SET {','.join(sets)} WHERE id=?",
+                    args + [branch_id])
+        con.commit()
+    finally:
+        con.close()
+
+
+def confirm_branch(branch_id, plan):
+    con = connect()
+    try:
+        con.execute(
+            "UPDATE understudy_branches SET status='confirmed', needs_review=0, "
+            "plan_json=?, confirmed_at=? WHERE id=?",
+            (json.dumps(plan, ensure_ascii=False), time.time(), branch_id))
+        con.commit()
+    finally:
+        con.close()
+
+
+def delete_branch(branch_id):
+    con = connect()
+    try:
+        con.execute("DELETE FROM understudy_branches WHERE id=?", (branch_id,))
+        con.commit()
+    finally:
+        con.close()
+
+
+def mark_understudy_dirty(pid, actor_ids=None, item_ids=None):
+    """资料变化时只标记相关替演分支待复核：
+    - 演员尺寸变化：卡司用到该演员（原角或候补）的分支；
+    - 服装/副本/适配变化：基准快照中含该服装的分支。
+    已确认分支只打标记、计划不重算；草稿分支提示资料已变、请重新推演。"""
+    con = connect()
+    try:
+        branches = rows(con,
+            "SELECT id, revision_id, cast_json FROM understudy_branches "
+            "WHERE production_id=?", (pid,))
+        for b in branches:
+            cast = json.loads(b["cast_json"] or "{}")
+            hit = False
+            if actor_ids:
+                used = {int(v) for v in cast.values()} | {int(k) for k in cast.keys()}
+                if {int(x) for x in actor_ids} & used:
+                    hit = True
+            if item_ids:
+                rev = row(con, "SELECT snapshot FROM revisions WHERE id=?", (b["revision_id"],))
+                if rev:
+                    snap_items = {i["id"] for i in json.loads(rev["snapshot"]).get("items", [])}
+                    if {int(x) for x in item_ids} & snap_items:
+                        hit = True
+            if hit:
+                con.execute("UPDATE understudy_branches SET needs_review=1 WHERE id=?", (b["id"],))
+        con.commit()
+    finally:
+        con.close()
+

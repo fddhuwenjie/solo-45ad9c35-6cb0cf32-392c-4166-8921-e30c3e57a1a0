@@ -63,6 +63,7 @@ def build_actions(task, state):
     positions = _index(state["positions"])
     carts = _index(state["carts"])
     by_look = look_items_map(state)
+    dur_ov = state.get("_duration_ov") or {}   # 替演：{(task_id,item_id,kind): 秒}
 
     from_sc, to_sc = scenes[task["from_scene_id"]], scenes[task["to_scene_id"]]
     pos = positions.get(task["position_id"])
@@ -81,16 +82,21 @@ def build_actions(task, state):
     props = [i for i in don if i["kind"] == "prop"]
     don_wear = [i for i in don if i["kind"] != "prop"]
 
+    def dur(tid, it, kind, base):
+        return dur_ov.get((tid, it["id"], kind), base)
+
     acts = [{"kind": "walk", "label": "退场→换装位", "dur": walk_sec(exit_pt, pos_pt),
              "item_id": None, "seq": 0}]
     seq_n = defaultdict(int)
     for it in doff:
-        acts.append({"kind": "doff", "label": f"脱·{it['name']}", "dur": it["doff_sec"],
+        acts.append({"kind": "doff", "label": f"脱·{it['name']}",
+                     "dur": dur(task["id"], it, "doff", it["doff_sec"]),
                      "item_id": it["id"], "needs_dresser": it["kind"] != "prop",
                      "seq": seq_n["doff"]})
         seq_n["doff"] += 1
     for it in don_wear:
-        acts.append({"kind": "don", "label": f"穿·{it['name']}", "dur": it["don_sec"],
+        acts.append({"kind": "don", "label": f"穿·{it['name']}",
+                     "dur": dur(task["id"], it, "don", it["don_sec"]),
                      "item_id": it["id"], "needs_dresser": True,
                      "seq": seq_n["don"]})
         seq_n["don"] += 1
@@ -432,10 +438,12 @@ def _seg_release(seg, tasks_by_id, scenes, items, doff_actuals=None):
     return (sc["start_sec"] + sc["duration_sec"]) if sc else 0
 
 
-def _copy_gap_abs(cps, t, end):
+def _copy_gap_abs(cps, t, end, blocked=frozenset()):
     """最早 t'≥t 使某副本在 [t', end) 全程空闲；无可行副本返回 None。"""
     best = None
-    for cp in cps:
+    for ci, cp in enumerate(cps):
+        if ci in blocked:
+            continue
         cur = t
         ok = True
         for iv in sorted(cp):
@@ -452,10 +460,12 @@ def _copy_gap_abs(cps, t, end):
     return best
 
 
-def _copy_gap_dur(cps, t, dur):
+def _copy_gap_dur(cps, t, dur, blocked=frozenset()):
     """最早 t'≥t 使某副本在 [t', t'+dur) 空闲（仅保证穿上动作本身不重叠）。"""
     best = None
-    for cp in cps:
+    for ci, cp in enumerate(cps):
+        if ci in blocked:
+            continue
         cur = t
         for iv in sorted(cp):
             if iv[1] <= cur:
@@ -468,11 +478,14 @@ def _copy_gap_dur(cps, t, dur):
     return best if best is not None else t
 
 
-def _pick_copy(cps, t, release):
+def _pick_copy(cps, t, release, blocked=frozenset()):
     """在 t 时刻选一件副本：要求 [t, release) 不与该副本已有区间冲突。
-    返回 (副本下标, 是否完全不冲突)；全部被占用返回 None。"""
+    返回 (副本下标, 是否完全不冲突)；全部被占用返回 None。blocked 中的副本
+    （已分配给同任务其它穿上动作）不参与自动选择。"""
     best = None
     for idx, cp in enumerate(cps):
+        if idx in blocked:
+            continue
         if any(iv[0] <= t < iv[1] for iv in cp):
             continue
         nxt = min((iv[0] for iv in cp if iv[0] > t), default=float("inf"))
@@ -610,6 +623,10 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
     """
     (_, _, dressers, skills, dresser_sk, dresser_sides,
      unavail, _review_by) = maps
+    # 替演：人工改派副本严格占用 {(task_id,item_id): 副本下标(0起)}；
+    # 自动分配排除的副本 {(task_id,item_id): frozenset(下标)}
+    pin_copy = state.get("_pin_copy") or {}
+    block_copies = state.get("_block_copies") or {}
     actor_busy = defaultdict(list)     # actor_id -> [(s,e,task_id)]
     dresser_busy = defaultdict(list)   # dresser_id -> [(s,e,tid,end_pt,key)]
     pos_busy = defaultdict(list)       # position_id -> [(s,e,task_id)]
@@ -682,27 +699,44 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
                     iid = a["item_id"]
                     it = items.get(iid)
                     rel = max(a.get("_release", 0), cur + a["dur"])
-                    t1 = _copy_gap_abs(copies[iid], cur, rel)
-                    if t1 is None:
-                        # 穿着全程无可行副本：退化为仅保证穿上动作本身不重叠，
-                        # 提交阶段若仍无法全程分配则拒绝（不产生重复分配）
-                        t2 = _copy_gap_dur(copies[iid], cur, a["dur"])
-                        item_wait_notes.append({
-                            "type": "item", "task_id": tid, "action_idx": ai,
-                            "time": t2, "message": f"缺件：{a['label']} 穿着期间无连续可用副本"})
-                        a["start"] = t2
-                        if record_root:
-                            root_item_notes.append(item_wait_notes[-1])
-                    elif t1 > cur:
-                        why = "清洁/维修中" if it and it["status"] != "ok" \
-                            else "复用等待（前一位演员尚未脱下）"
-                        item_wait_notes.append({
-                            "type": "item", "task_id": tid, "action_idx": ai,
-                            "time": t1, "message": f"缺件/复用冲突：{a['label']} 需等到 "
-                                                   f"{fmt(t1)}（{why}）"})
-                        a["start"] = t1
-                        if record_root:
-                            root_item_notes.append(item_wait_notes[-1])
+                    pin_idx = pin_copy.get((tid, iid))
+                    blocked = block_copies.get((tid, iid)) or frozenset()
+                    if pin_idx is not None and pin_idx < len(copies.get(iid, [])):
+                        # 人工改派：严格占用指定副本，不等待、不顺延，被占即冲突
+                        cp = copies[iid][pin_idx]
+                        busy_iv = next((iv for iv in cp if iv[0] < rel and iv[1] > cur), None)
+                        if busy_iv is not None:
+                            note = {
+                                "type": "copy_pin", "task_id": tid, "action_idx": ai,
+                                "time": cur, "action_label": a["label"],
+                                "message": f"{a['label']}：人工改派副本#{pin_idx + 1}在 "
+                                           f"{fmt(max(cur, busy_iv[0]))} 已被占用"
+                                           f"（{busy_iv[2]}），改派冲突"}
+                            item_wait_notes.append(note)
+                            if record_root:
+                                root_item_notes.append(note)
+                    else:
+                        t1 = _copy_gap_abs(copies[iid], cur, rel, blocked=blocked)
+                        if t1 is None:
+                            # 穿着全程无可行副本：退化为仅保证穿上动作本身不重叠，
+                            # 提交阶段若仍无法全程分配则拒绝（不产生重复分配）
+                            t2 = _copy_gap_dur(copies[iid], cur, a["dur"], blocked=blocked)
+                            item_wait_notes.append({
+                                "type": "item", "task_id": tid, "action_idx": ai,
+                                "time": t2, "message": f"缺件：{a['label']} 穿着期间无连续可用副本"})
+                            a["start"] = t2
+                            if record_root:
+                                root_item_notes.append(item_wait_notes[-1])
+                        elif t1 > cur:
+                            why = "清洁/维修中" if it and it["status"] != "ok" \
+                                else "复用等待（前一位演员尚未脱下）"
+                            item_wait_notes.append({
+                                "type": "item", "task_id": tid, "action_idx": ai,
+                                "time": t1, "message": f"缺件/复用冲突：{a['label']} 需等到 "
+                                                       f"{fmt(t1)}（{why}）"})
+                            a["start"] = t1
+                            if record_root:
+                                root_item_notes.append(item_wait_notes[-1])
                 cur = a["start"]
                 a["end"] = cur + a["dur"]
 
@@ -859,7 +893,25 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
                 continue
             if a["kind"] == "don":
                 rel = max(a.get("_release", a["end"]), a["end"])
-                pick = _pick_copy(copies[iid], a["start"], rel)
+                pin_idx = pin_copy.get((tid, iid))
+                blocked = block_copies.get((tid, iid)) or frozenset()
+                if pin_idx is not None and pin_idx < len(copies[iid]):
+                    # 人工改派：严格模式，被占时绝不改派到其它副本
+                    cp = copies[iid][pin_idx]
+                    busy_iv = next((iv for iv in cp if iv[0] < rel and iv[1] > a["start"]), None)
+                    if busy_iv is not None:
+                        item_commit_notes.append({
+                            "type": "copy_pin", "task_id": tid,
+                            "action_idx": a["action_idx"],
+                            "time": a["start"], "action_label": a["label"],
+                            "message": f"{a['label']}：人工改派副本#{pin_idx + 1}被并发占用"
+                                       f"（{busy_iv[2]}），未分配"})
+                    else:
+                        iv = [a["start"], rel, f"task:{tid}"]
+                        cp.append(iv)
+                        worn[(aid, iid)] = (pin_idx, iv)
+                    continue
+                pick = _pick_copy(copies[iid], a["start"], rel, blocked=blocked)
                 if pick is None or not pick[1]:
                     # 无连续可用副本：拒绝分配，绝不放置交叠区间
                     item_commit_notes.append({
