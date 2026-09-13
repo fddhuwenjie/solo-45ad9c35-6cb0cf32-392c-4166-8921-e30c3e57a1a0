@@ -23,10 +23,12 @@ FIELDS = {
     "actors": ["name", "code", "default_side"],
     "looks": ["actor_id", "scene_id", "name"],
     "items": ["name", "kind", "layer", "don_sec", "doff_sec", "status",
-              "available_at", "cart_id", "copies"],
+              "available_at", "cart_id", "copies", "skill_id"],
     "dressers": ["name"],
+    "skills": ["name"],
     "positions": ["name", "side", "x", "y", "capacity"],
     "carts": ["name", "side", "x", "y", "capacity"],
+    "dresser_unavailable": ["dresser_id", "start_sec", "end_sec", "reason"],
     "tasks": ["actor_id", "from_scene_id", "to_scene_id", "exit_side",
               "position_id", "dresser_id", "start_sec", "locked", "note"],
 }
@@ -122,8 +124,158 @@ def api_apply_suggestion():
         cur = con.execute("SELECT locked FROM tasks WHERE id=?", (tid,)).fetchone()
         if cur and cur["locked"]:
             return jsonify({"ok": False, "error": "已锁节点不得移动"}), 409
+        # 动作级分工替代排法（不动已锁分工）
+        for sc in data.get("staff_changes", []):
+            if _staff_row_locked(con, tid, sc["kind"], sc.get("item_id"), sc.get("seq", 0)):
+                return jsonify({"ok": False, "error": "该动作分工已锁，不能替换"}), 409
+            _replace_action_staff(con, tid, sc["kind"], sc.get("item_id"),
+                                  sc.get("seq", 0), sc.get("dresser_ids", []), PID)
         con.execute("UPDATE tasks SET position_id=?, dresser_id=?, start_sec=? WHERE id=?",
                     (ch.get("position_id"), ch.get("dresser_id"), ch.get("start_sec"), tid))
+        con.commit()
+    finally:
+        con.close()
+    return jsonify(full_state())
+
+
+def _staff_row_locked(con, tid, kind, item_id, seq):
+    row = con.execute(
+        "SELECT 1 FROM action_staff WHERE task_id=? AND kind=? "
+        "AND COALESCE(item_id,-1)=COALESCE(?,-1) AND seq=? AND locked=1 LIMIT 1",
+        (tid, kind, item_id, seq)).fetchone()
+    return row is not None
+
+
+def _replace_action_staff(con, tid, kind, item_id, seq, dresser_ids, pid,
+                          lead_id=None):
+    """整体替换某动作分工（同一请求内）。"""
+    con.execute(
+        "DELETE FROM action_staff WHERE task_id=? AND kind=? "
+        "AND COALESCE(item_id,-1)=COALESCE(?,-1) AND seq=?",
+        (tid, kind, item_id, seq))
+    seen = set()
+    for did in dresser_ids:
+        did = int(did)
+        if did in seen:
+            continue
+        seen.add(did)
+        is_lead = 1 if (lead_id or dresser_ids[0]) == did else 0
+        con.execute(
+            "INSERT INTO action_staff(production_id,task_id,kind,item_id,seq,"
+            "dresser_id,is_lead,locked,created_at) VALUES(?,?,?,?,?,?,?,0,?)",
+            (pid, tid, kind, item_id, seq, did, is_lead, time.time()))
+
+
+@app.post("/api/tasks/<int:tid>/action_spec")
+def api_action_spec(tid):
+    """设置某穿脱动作的所需技能与人数。"""
+    data = request.get_json(force=True)
+    kind = data.get("kind")
+    if kind not in ("don", "doff", "fetch", "walk"):
+        return jsonify({"ok": False, "error": "动作类型必须是 don/doff/fetch/walk"}), 400
+    item_id = data.get("item_id")
+    seq = int(data.get("seq", 0))
+    required = int(data.get("required_count", 1))
+    if required < 1:
+        return jsonify({"ok": False, "error": "所需人数至少 1 人"}), 400
+    skill_id = data.get("skill_id")
+    con = db.connect()
+    try:
+        if not con.execute("SELECT 1 FROM tasks WHERE id=?", (tid,)).fetchone():
+            return jsonify({"ok": False, "error": "任务不存在"}), 404
+        row = con.execute(
+            "SELECT id FROM action_specs WHERE task_id=? AND kind=? "
+            "AND COALESCE(item_id,-1)=COALESCE(?,-1) AND seq=?",
+            (tid, kind, item_id, seq)).fetchone()
+        if row:
+            con.execute("UPDATE action_specs SET skill_id=?, required_count=? WHERE id=?",
+                        (skill_id, required, row["id"]))
+        else:
+            con.execute(
+                "INSERT INTO action_specs(production_id,task_id,kind,item_id,seq,"
+                "skill_id,required_count) VALUES(?,?,?,?,?,?,?)",
+                (PID, tid, kind, item_id, seq, skill_id, required))
+        con.commit()
+    finally:
+        con.close()
+    return jsonify(full_state())
+
+
+@app.post("/api/tasks/<int:tid>/action_staff")
+def api_action_staff(tid):
+    """登记某动作分工：{kind,item_id,seq,dresser_ids,lead_id,locked}。
+    已锁分工需同请求解锁（locked=0）才能改。"""
+    data = request.get_json(force=True)
+    kind = data.get("kind")
+    if kind not in ("don", "doff", "fetch", "walk"):
+        return jsonify({"ok": False, "error": "动作类型必须是 don/doff/fetch/walk"}), 400
+    item_id = data.get("item_id")
+    seq = int(data.get("seq", 0))
+    ids = [int(x) for x in data.get("dresser_ids", [])]
+    lead = data.get("lead_id")
+    lead = int(lead) if lead is not None else (ids[0] if ids else None)
+    locked = 1 if data.get("locked") else 0
+    con = db.connect()
+    try:
+        t = con.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+        if not t:
+            return jsonify({"ok": False, "error": "任务不存在"}), 404
+        existing = con.execute(
+            "SELECT * FROM action_staff WHERE task_id=? AND kind=? "
+            "AND COALESCE(item_id,-1)=COALESCE(?,-1) AND seq=?",
+            (tid, kind, item_id, seq)).fetchall()
+        was_locked = any(r["locked"] for r in existing)
+        if was_locked and locked == 1 and data.get("_changing", True):
+            # 已锁：只允许显式解锁请求改写
+            if not data.get("unlock"):
+                return jsonify({"ok": False,
+                                "error": "该动作分工已锁（连排确认）：请先解锁"}), 409
+        valid = {r["id"] for r in con.execute(
+            "SELECT id FROM dressers WHERE production_id=?", (PID,)).fetchall()}
+        if any(x not in valid for x in ids):
+            return jsonify({"ok": False, "error": "存在不属于本剧目的服装师"}), 400
+        if lead is not None and lead not in ids:
+            return jsonify({"ok": False, "error": "固定负责人必须在参与者中"}), 400
+        _replace_action_staff(con, tid, kind, item_id, seq, ids, PID, lead_id=lead)
+        if locked:
+            con.execute(
+                "UPDATE action_staff SET locked=1 WHERE task_id=? AND kind=? "
+                "AND COALESCE(item_id,-1)=COALESCE(?,-1) AND seq=?",
+                (tid, kind, item_id, seq))
+        con.commit()
+    finally:
+        con.close()
+    return jsonify(full_state())
+
+
+@app.post("/api/dressers/<int:did>/profile")
+def api_dresser_profile(did):
+    """服装师资料：技能（skill_ids）、可支援侧台（sides）。
+    资料变化只标记引用该服装师的动作所属任务待复核。"""
+    data = request.get_json(force=True)
+    con = db.connect()
+    try:
+        if not con.execute("SELECT 1 FROM dressers WHERE id=? AND production_id=?",
+                           (did, PID)).fetchone():
+            return jsonify({"ok": False, "error": "服装师不存在"}), 404
+        if "skill_ids" in data:
+            con.execute("DELETE FROM dresser_skills WHERE dresser_id=?", (did,))
+            for sid in set(int(x) for x in data["skill_ids"]):
+                con.execute("INSERT OR IGNORE INTO dresser_skills(dresser_id,skill_id) "
+                            "VALUES(?,?)", (did, sid))
+        if "sides" in data:
+            sides = set(data["sides"]) & {"L", "R"}
+            con.execute("DELETE FROM dresser_sides WHERE dresser_id=?", (did,))
+            for sd in sides:
+                con.execute("INSERT OR IGNORE INTO dresser_sides(dresser_id,side) "
+                            "VALUES(?,?)", (did, sd))
+        # 资料变化 → 仅相关动作（引用该服装师的分工）待复核
+        con.execute("""
+            UPDATE tasks SET needs_review=1 WHERE id IN (
+                SELECT DISTINCT task_id FROM action_staff WHERE dresser_id=?)
+            OR id IN (
+                SELECT DISTINCT t.id FROM tasks t WHERE t.dresser_id=?)""",
+                    (did, did))
         con.commit()
     finally:
         con.close()
@@ -166,7 +318,7 @@ def api_update(entity, rid):
             con.execute(
                 "UPDATE tasks SET needs_review=1 WHERE from_scene_id=? OR to_scene_id=?",
                 (rid, rid))
-        if entity == "items" and {"status", "available_at", "cart_id"} & set(data):
+        if entity == "items" and {"status", "available_at", "cart_id", "skill_id"} & set(data):
             con.execute("""
               UPDATE tasks SET needs_review=1 WHERE id IN (
                 SELECT t.id FROM tasks t
@@ -312,6 +464,16 @@ def api_run_event(run_id):
             return jsonify({"ok": False, "error": "copy_id 必须是整数"}), 400
         if copy_id < 1:
             return jsonify({"ok": False, "error": "copy_id 必须 ≥ 1"}), 400
+    # 实际参与者（可空=按冻结分工）：必须是冻结基准中的服装师
+    dresser_ids = data.get("dresser_ids")
+    if dresser_ids is not None:
+        try:
+            dresser_ids = sorted({int(x) for x in dresser_ids})
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "dresser_ids 必须是整数列表"}), 400
+        valid = {d["id"] for d in plan["dressers"]}
+        if any(x not in valid for x in dresser_ids):
+            return jsonify({"ok": False, "error": "参与者不在本次连排基准人员中"}), 400
     events = db.run_events(run_id)
     prev = rehearsal.effective_events(events).get((tid, idx, kind))
     if prev and not reason:
@@ -319,7 +481,7 @@ def api_run_event(run_id):
                         "error": "补正已有打点必须填写理由（原记录保留备查）"}), 400
     db.add_event(run_id, tid, idx, kind, at_sec, reason,
                  supersedes=prev["id"] if prev else None,
-                 item_id=item_id, copy_id=copy_id)
+                 item_id=item_id, copy_id=copy_id, dresser_ids=dresser_ids)
     return jsonify({"ok": True, "run": _run_detail(run_id)})
 
 
@@ -350,7 +512,8 @@ def api_run_derive():
         return jsonify({"ok": False, "error": "必须指定所选连排 run_id"}), 400
     result = rehearsal.derive_revision(run_id, data.get("keys", []), PID)
     if not result:
-        return jsonify({"ok": False, "error": "连排/基准修订不存在，或没有可应用的建议"}), 400
+        return jsonify({"ok": False, "error": "连排/基准修订不存在、基准数据不完整"
+                                              "（旧版修订缺辅助状态），或没有可应用的建议"}), 400
     out = full_state()
     out["derived"] = result
     return jsonify(out)
@@ -387,8 +550,20 @@ def export_cue(actor_id):
                if t["actor_id"] == actor_id]
     details.sort(key=lambda d: d["window"]["start"])
     rows = []
+    def _staff_names(tid, a):
+        st = a.get("staff", {})
+        ids = st.get("ids") if st else None
+        if ids is None and t["dresser_id"]:
+            ids = [t["dresser_id"]]
+        names = [drs[i]["name"] for i in (ids or []) if i in drs]
+        return "、".join(names) if names else ""
+
     for d in details:
-        acts = " → ".join(f"{a['label']}({a['dur']}s)" for a in d["actions"])
+        parts = []
+        for a in d["actions"]:
+            who = _staff_names(d["task"], a)
+            parts.append(f"{a['label']}({a['dur']}s" + (f"·{who}" if who else "") + ")")
+        acts = " → ".join(parts)
         rows.append(
             f"<tr><td>{scheduler.fmt(d['window']['start'])}</td>"
             f"<td>{d['from_scene']['name']} → {d['to_scene']['name']}</td>"
@@ -403,6 +578,67 @@ td,th{{border:1px solid #999;padding:6px 8px;font-size:13px;vertical-align:top}}
 h1{{font-size:20px}}</style>
 <h1>个人换装提示单 · {actor['name']}（{actor['code']}）</h1>
 <table><tr><th>开始</th><th>场次</th><th>换装位</th><th>服装师</th><th>须于前完成</th><th>动作顺序</th></tr>
+{''.join(rows)}</table>"""
+    return html
+
+
+@app.get("/export/dresser_cue/<int:did>")
+def export_dresser_cue(did):
+    """服装师个人提示单：只列其参与的动作；?run_id= 时引用连排冻结分工。"""
+    run_id = request.args.get("run_id", type=int)
+    if run_id:
+        d = _run_detail(run_id)
+        if not d:
+            return "连排不存在", 404
+        plan = d["plan"]
+        dressers = {x["id"]: x for x in plan["dressers"]}
+        actors = {x["id"]: x for x in plan["actors"]}
+        scenes = {x["id"]: x for x in plan["scenes"]}
+        tasks = {x["id"]: x for x in plan["tasks"]}
+        actions = [a for a in plan["actions"] if did in (a.get("staff_ids") or [])]
+        title_extra = f"｜{d['run']['name']}（冻结分工，基准修订#{d['run']['revision_id']}）"
+    else:
+        state = db.load_state(PID)
+        sched = scheduler.compute_schedule(state)
+        dressers = {x["id"]: x for x in state["dressers"]}
+        actors = {x["id"]: x for x in state["actors"]}
+        scenes = {x["id"]: x for x in state["scenes"]}
+        tasks = {x["id"]: x for x in state["tasks"]}
+        actions = [a for a in sched["actions"]
+                   if did in (a.get("staff", {}) or {}).get("ids", [])]
+        title_extra = ""
+    dresser = dressers.get(did)
+    if not dresser:
+        return "服装师不存在", 404
+    rows = []
+    for a in sorted(actions, key=lambda x: x["start"]):
+        t = tasks[a["task_id"]]
+        ac = actors.get(t["actor_id"])
+        fs = scenes.get(t["from_scene_id"])
+        ts = scenes.get(t["to_scene_id"])
+        mates = []
+        if run_id:
+            ids = [x for x in (a.get("staff_ids") or []) if x != did]
+        else:
+            ids = [x for x in a["staff"]["ids"] if x != did]
+        mates = "、".join(dressers[i]["name"] for i in ids if i in dressers)
+        lead = ((a.get("lead_id") if run_id else a["staff"].get("lead_id")) == did)
+        rows.append(
+            f"<tr><td>{scheduler.fmt(a['start'])}</td>"
+            f"<td>#{t['id']} {ac['name'] if ac else ''}</td>"
+            f"<td>{fs['name'] if fs else ''} → {ts['name'] if ts else ''}</td>"
+            f"<td>{a['label']}</td>"
+            f"<td>{'负责人' if lead else '协作'}</td>"
+            f"<td>{mates or '—'}</td>"
+            f"<td>{'🔒' if (a.get('staff_locked') if run_id else a['staff'].get('locked')) else ''}</td></tr>")
+    html = f"""<!doctype html><html lang=zh><meta charset=utf-8>
+<title>服装师提示单 · {dresser['name']}</title>
+<style>body{{font-family:sans-serif;margin:24px}}table{{border-collapse:collapse;width:100%}}
+td,th{{border:1px solid #999;padding:6px 8px;font-size:13px;vertical-align:top}}
+h1{{font-size:20px}}</style>
+<h1>服装师个人提示单 · {dresser['name']}{title_extra}</h1>
+<table><tr><th>开始</th><th>演员/任务</th><th>场次</th><th>负责动作</th><th>角色</th>
+<th>搭档（双人同步/交接）</th><th>锁定</th></tr>
 {''.join(rows)}</table>"""
     return html
 
@@ -602,8 +838,12 @@ def export_run_record(run_id):
     plan, ana, run = d["plan"], d["analysis"], d["run"]
     tasks = {t["id"]: t for t in plan["tasks"]}
     actors = {a["id"]: a for a in plan["actors"]}
+    dressers = {x["id"]: x for x in plan["dressers"]}
     actuals = ana["actuals"]
     by_id = {e["id"]: e for e in d["events"]}
+
+    def dnames(ids):
+        return "、".join(dressers[i]["name"] for i in ids if i in dressers) or "自助"
 
     def corr_note(e):
         """补正说明：原时刻 → 新时刻 + 理由。"""
@@ -629,12 +869,21 @@ def export_run_record(run_id):
         if ac.get("start") is not None:
             dd = ac["start"] - a["start"]
             dev = f"{dd:+d}s" if dd else "0"
+        # 实际参与者（打点登记）对照冻结分工
+        actual_ids = rehearsal._event_participants(d["events"],
+                                                    rehearsal.effective_events(d["events"]),
+                                                    tid, a["idx"], a)
+        plan_ids = a.get("staff_ids") or []
+        staff_cell = f"{dnames(actual_ids)}"
+        if set(actual_ids) != set(plan_ids):
+            staff_cell += f" <span style='color:#c0392b'>(计划：{dnames(plan_ids)})</span>"
         rows.append(
             f"<tr><td>#{tid}</td><td>{actors[tasks[tid]['actor_id']]['name']}</td>"
             f"<td>{a['idx']} {a['label']}</td>"
             f"<td>{scheduler.fmt(a['start'])}（{a['dur']}s）</td>"
             f"<td>{scheduler.fmt(ac['start']) if ac.get('start') is not None else ('跳过' if ac.get('skipped') else '—')}</td>"
             f"<td>{scheduler.fmt(ac['end']) if ac.get('end') is not None else '—'}</td>"
+            f"<td>{staff_cell}</td>"
             f"<td>{dev}</td><td class=note>{'；'.join(notes)}</td></tr>")
     ana_rows = "".join(
         f"<li>[{scheduler.fmt(c['time'])}] 任务#{c['task_id']} {c['message']}</li>"
@@ -655,7 +904,7 @@ h1{{font-size:19px}}h2{{font-size:15px;margin-top:18px}}.note{{color:#a04000}}</
 ｜状态 {'已结束' if run['status']=='done' else '进行中'}</p>
 <h2>动作实测对照</h2>
 <table><tr><th>任务</th><th>演员</th><th>动作</th><th>计划开始(时长)</th><th>实测开始</th>
-<th>实测完成</th><th>偏差</th><th>异常/补正理由</th></tr>{''.join(rows)}</table>
+<th>实测完成</th><th>实际参与者(冻结分工)</th><th>偏差</th><th>异常/补正理由</th></tr>{''.join(rows)}</table>
 <h2>实测检查</h2><ul>{ana_rows}</ul>
 <h2>首个偏差与等待链</h2>{fd_html}<ul>{chain_html}</ul>"""
     return html

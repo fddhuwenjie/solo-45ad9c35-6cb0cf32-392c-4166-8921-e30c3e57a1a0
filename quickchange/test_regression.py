@@ -259,6 +259,19 @@ def _state_delayed_doff():
         "dressers": [{"id": 1, "production_id": 1, "name": "王姐"}],
         "positions": [],
         "carts": [],
+        # 动作级分工：王姐负责甲脱下任务的全部动作（含走位与交接空当）。
+        # 动作级模型允许动作交接背靠背（[a,b) 与 [b,c) 不冲突），
+        # 登记全部动作后王姐在交接空当仍占用，与旧整段负责人语义一致。
+        "action_staff": [
+            {"id": 1, "production_id": 1, "task_id": 2, "kind": k,
+             "item_id": iid, "seq": sq, "dresser_id": 1, "is_lead": 1,
+             "locked": 0, "created_at": 0}
+            for k, iid, sq in (
+                ("walk", None, 0), ("doff", 2, 0), ("don", 1, 0),
+                ("walk", None, 1))
+        ],
+        "action_specs": [], "skills": [], "dresser_skills": [],
+        "dresser_sides": [], "dresser_unavailable": [],
         "tasks": [
             {"id": 1, "production_id": 1, "actor_id": 1, "from_scene_id": 1, "to_scene_id": 2,
              "exit_side": "L", "position_id": None, "dresser_id": None, "start_sec": None,

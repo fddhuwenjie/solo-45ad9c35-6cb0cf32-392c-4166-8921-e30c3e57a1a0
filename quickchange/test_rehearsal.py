@@ -53,9 +53,11 @@ def _base_scene(con, hat_copies=2, cloak_copies=2):
     con.execute("INSERT INTO actors VALUES(1,1,'甲','J','L')")
     con.execute("INSERT INTO actors VALUES(2,1,'乙','Y','L')")
     con.execute("INSERT INTO dressers VALUES(1,1,'王姐')")
-    con.execute("INSERT INTO items VALUES(1,1,'斗篷','costume',2,4,4,'ok',0,NULL,?)",
+    con.execute("INSERT INTO items(id,production_id,name,kind,layer,don_sec,doff_sec,"
+                "status,available_at,cart_id,copies) VALUES(1,1,'斗篷','costume',2,4,4,'ok',0,NULL,?)",
                 (cloak_copies,))
-    con.execute("INSERT INTO items VALUES(2,1,'帽子','costume',1,4,4,'ok',0,NULL,?)",
+    con.execute("INSERT INTO items(id,production_id,name,kind,layer,don_sec,doff_sec,"
+                "status,available_at,cart_id,copies) VALUES(2,1,'帽子','costume',1,4,4,'ok',0,NULL,?)",
                 (hat_copies,))
     # 造型：甲 S1 斗篷 / S2 帽子；乙 S1 斗篷 / S3 斗篷+帽子
     con.execute("INSERT INTO looks VALUES(1,1,1,1,'')")
@@ -101,10 +103,11 @@ def test_run_freezes_plan_and_never_rewrites_baseline():
     run_id = _make_run(client)
 
     d = client.get(f"/api/runs/{run_id}").get_json()
-    # 基准计划已冻结：任务#1 计划 [100,110]，任务#2 等服装师 → [110,116]
+    # 基准计划已冻结：任务#1 [100,110]；任务#2 等王姐动作交接（背靠背），
+    # walk 不占人 → [109,115]，穿上动作 110–114
     w = d["plan"]["windows"]
     assert (w["1"]["start"], w["1"]["end"]) == (100, 110), w["1"]
-    assert (w["2"]["start"], w["2"]["end"]) == (110, 116), w["2"]
+    assert (w["2"]["start"], w["2"]["end"]) == (109, 115), w["2"]
 
     before = db.snapshot(1)
     assert _punch(client, run_id, 1, 0, "start", 125).get_json()["ok"]
@@ -230,7 +233,8 @@ def test_item_copy_misuse_detected():
     con.execute("INSERT INTO scenes VALUES(3,1,3,'S3',220,100)")
     con.execute("INSERT INTO actors VALUES(1,1,'甲','J','L')")
     con.execute("INSERT INTO actors VALUES(2,1,'乙','Y','L')")
-    con.execute("INSERT INTO items VALUES(1,1,'斗篷','costume',2,4,4,'ok',0,NULL,1)")
+    con.execute("INSERT INTO items(id,production_id,name,kind,layer,don_sec,doff_sec,"
+                "status,available_at,cart_id,copies) VALUES(1,1,'斗篷','costume',2,4,4,'ok',0,NULL,1)")
     for lid, aid, sid in ((1, 1, 1), (2, 1, 2), (3, 1, 3), (4, 2, 2), (5, 2, 3)):
         con.execute("INSERT INTO looks(id,production_id,actor_id,scene_id,name) "
                     "VALUES(?,1,?,?,'')", (lid, aid, sid))
@@ -428,6 +432,54 @@ def test_summary_groups_by_dresser():
     os.unlink(tmp)
 
 
+# ---------- 用例 10：造型关系漂移不影响派生（辅助状态全部来自冻结基准） ----------
+
+def test_derive_isolated_from_look_items_drift():
+    tmp = _fresh_db()
+    con = db.connect()
+    _base_scene(con)
+    con.close()
+    client = _client()
+
+    # 连排：帽子穿上实测 6s（基准 4s），王姐配置
+    run_id = _make_run(client)
+    _punch(client, run_id, 1, 2, "start", 100)
+    _punch(client, run_id, 1, 2, "done", 106)
+    client.post(f"/api/runs/{run_id}/close")
+
+    # 连排后删除当前帽子造型关系（look 2=甲S2、look 4=乙S3 均含帽子 item 2）
+    client.post("/api/look_items", json={"look_id": 2, "item_ids": []})
+    client.post("/api/look_items", json={"look_id": 4, "item_ids": [1]})
+    con = db.connect()
+    assert not con.execute("SELECT 1 FROM look_items WHERE item_id=2").fetchone()
+    con.close()
+
+    # 派生：冻结基准里帽子仍在 —— 任务#1 的穿上 +2s（交接点 109→111），
+    # 等王姐动作交接的任务#2 应从 109 移到 111（旧实现读当前 look_items
+    # 会 moved=0、start=None；整段占用旧模型则为 110→112）
+    r = client.get("/api/runs/summary?revision_id=1").get_json()
+    s = next((x for x in r["suggestions"] if x["key"] == "2:don:1"), None)
+    assert s, f"冻结基准应仍给出帽子建议：{r}"
+    r = client.post("/api/runs/derive",
+                    json={"run_id": run_id, "keys": [s["key"]]}).get_json()
+    assert "derived" in r, r
+    assert r["derived"]["moved"] >= 1, f"任务#2 应被重排：{r['derived']}"
+
+    import json as _json
+    con = db.connect()
+    snap = _json.loads(con.execute("SELECT snapshot FROM revisions WHERE id=?",
+                                   (r["derived"]["revision_id"],)).fetchone()["snapshot"])
+    con.close()
+    t2 = next(t for t in snap["tasks"] if t["id"] == 2)
+    hat = next(i for i in snap["items"] if i["id"] == 2)
+    assert t2["start_sec"] == 111, f"任务#2 应从 109 移到 111：{t2['start_sec']}"
+    assert hat["don_sec"] == 6, f"建议值应写回冻结服装：{hat['don_sec']}"
+    # 派生快照自带辅助状态，且与冻结基准一致（帽子造型关系未丢）
+    assert any(li["item_id"] == 2 for li in snap["look_items"] if li["look_id"] == 2), \
+        "派生快照的造型关系应来自冻结基准"
+    os.unlink(tmp)
+
+
 if __name__ == "__main__":
     print("连排实测回归测试：")
     check("开启连排冻结基准，实测不改写基准方案", test_run_freezes_plan_and_never_rewrites_baseline)
@@ -439,4 +491,6 @@ if __name__ == "__main__":
     check("计划漂移后回看连排仍读冻结 plan", test_plan_drift_does_not_leak_into_run_view)
     check("错误服装身份与副本编号识别", test_wrong_item_identity_and_copy)
     check("同一服装动作按不同服装师分组", test_summary_groups_by_dresser)
+    check("造型关系漂移不影响派生（辅助状态来自冻结基准）",
+          test_derive_isolated_from_look_items_drift)
     print(f"全部通过（{len(PASS)} 项）")

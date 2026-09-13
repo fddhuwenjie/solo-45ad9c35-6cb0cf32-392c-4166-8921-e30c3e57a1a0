@@ -9,6 +9,7 @@
 """
 import json
 import math
+from collections import defaultdict
 
 import db
 import scheduler
@@ -22,15 +23,26 @@ def fmt(sec):
     return scheduler.fmt(sec)
 
 
+# 排程所需的辅助状态：这些表不在旧版修订快照（scenes/tasks/items）内，
+# 冻结基准必须自带，派生/回看时不得回读当前可变表。
+AUX_KEYS = ("looks", "look_items", "actors", "dressers", "positions", "carts",
+            "skills", "dresser_skills", "dresser_sides", "dresser_unavailable",
+            "action_specs", "action_staff")
+
+
 # ---------------- 基准计划冻结 ----------------
 
 def freeze_plan(state, snap):
-    """以修订快照（scenes/tasks/items）为基准、当前辅助数据（造型/人员/位置）为配套，
-    计算排程并冻结为连排基准计划。"""
+    """以修订快照（scenes/tasks/items，新版含辅助表）为基准计算排程并冻结。
+    快照缺少辅助表时（旧版修订）以开启连排时的当前辅助数据补齐，
+    并一并冻结进 plan，保证此后回看/派生不再依赖当前可变状态。"""
     base = dict(state)
     base["scenes"] = snap["scenes"]
     base["tasks"] = snap["tasks"]
     base["items"] = snap["items"]
+    for k in AUX_KEYS:
+        if snap.get(k) is not None:        # 空列表也是已冻结的合法状态
+            base[k] = snap[k]
     sched = scheduler.compute_schedule(base)
 
     by_task = {}
@@ -40,20 +52,25 @@ def freeze_plan(state, snap):
     for tid, acts in by_task.items():
         acts.sort(key=lambda a: (a["start"], a["end"]))
         for idx, a in enumerate(acts):
+            st = a.get("staff", {})
             actions.append({
                 "task_id": tid, "idx": idx, "kind": a["kind"], "label": a["label"],
                 "dur": a["dur"], "item_id": a.get("item_id"),
+                "seq": a.get("seq", 0),
                 "start": int(a["start"]), "end": int(a["end"]),
+                # 冻结分工：修订/提示单/实测对照都引用它，不回读当前可变人员表
+                "staff_ids": list(st.get("ids", [])),
+                "lead_id": st.get("lead_id"),
+                "required": st.get("required", 0),
+                "required_skill": st.get("required_skill"),
+                "staff_locked": bool(st.get("locked")),
+                "legacy_staff": bool(st.get("legacy")),
             })
     slim_items = [{"id": i["id"], "name": i["name"], "kind": i["kind"],
                    "copies": i["copies"], "don_sec": i["don_sec"],
                    "doff_sec": i["doff_sec"]} for i in snap["items"]]
-    return {
+    plan = {
         "scenes": snap["scenes"],
-        "actors": [{"id": a["id"], "name": a["name"]} for a in state["actors"]],
-        "dressers": [{"id": d["id"], "name": d["name"]} for d in state["dressers"]],
-        "positions": [{"id": p["id"], "name": p["name"], "capacity": p["capacity"]}
-                      for p in state["positions"]],
         "items": slim_items,
         "tasks": [{k: t[k] for k in ("id", "actor_id", "from_scene_id", "to_scene_id",
                                      "exit_side", "position_id", "dresser_id",
@@ -61,6 +78,10 @@ def freeze_plan(state, snap):
         "actions": actions,
         "windows": {str(tid): w for tid, w in sched["windows"].items()},
     }
+    # 辅助状态一并冻结：回看/派生不再回读当前可变表
+    for k in AUX_KEYS:
+        plan[k] = base[k]
+    return plan
 
 
 def load_plan(run):
@@ -80,6 +101,35 @@ def effective_events(events):
             continue
         eff[(e["task_id"], e["action_idx"], e["kind"])] = e
     return eff
+
+
+def _parse_ids(raw):
+    if not raw:
+        return []
+    try:
+        return [int(x) for x in json.loads(raw)]
+    except (ValueError, TypeError):
+        return []
+
+
+def _event_participants(events, eff, tid, idx, plan_action):
+    """该动作实测参与者：开始打点登记的 dresser_ids 为准（开始/完成合并取并集），
+    未登记则回退冻结分工（旧连排兼容）。"""
+    ids = []
+    for kind in ("start", "done"):
+        ev = eff.get((tid, idx, kind))
+        if ev and ev["dresser_ids"]:
+            for x in _parse_ids(ev["dresser_ids"]):
+                if x not in ids:
+                    ids.append(x)
+    if not ids:
+        ids = list(plan_action.get("staff_ids") or [])
+    return ids
+
+
+def _names(ids, dressers):
+    names = [dressers[i]["name"] if i in dressers else f"#{i}" for i in sorted(ids)]
+    return "、".join(names) if names else "无"
 
 
 def action_actuals(plan, eff):
@@ -169,7 +219,8 @@ def analyze(run, events):
                 prev_end = dn if dn is not None else st
                 prev_label = a["label"]
 
-    # 2) 资源并发：演员/服装师独占、换装位容量
+    # 2) 资源并发：演员独占、换装位容量按任务实测区间；
+    #    服装师按动作实测区间与实际参与者（中途换手也能检出重叠）
     intervals = task_intervals(plan, actuals)
     actors = {a["id"]: a for a in plan["actors"]}
     dressers = {d["id"]: d for d in plan["dressers"]}
@@ -189,11 +240,53 @@ def analyze(run, events):
                                   "time": max(intervals[t1][0], intervals[t2][0]),
                                   "message": f"演员并发冲突：{actors[a['actor_id']]['name']} "
                                              f"在任务#{t1}与#{t2}的实测区间重叠"})
-            if a["dresser_id"] and a["dresser_id"] == b["dresser_id"]:
-                anomalies.append({"type": "concurrency", "task_id": t2,
-                                  "time": max(intervals[t1][0], intervals[t2][0]),
-                                  "message": f"服装师并发冲突：{dressers[a['dresser_id']]['name']} "
-                                             f"同时照看任务#{t1}与#{t2}"})
+
+    # 2b) 实际参与者 → 服装师动作实测区间（以开始/完成打点为准）
+    dr_intervals = defaultdict(list)   # dresser_id -> [(s,e,tid,idx)]
+    for a in plan["actions"]:
+        tid, idx = a["task_id"], a["idx"]
+        ac = actuals.get((tid, idx), {})
+        if ac.get("start") is None:
+            continue
+        st, en = ac["start"], ac["end"] if ac["end"] is not None else ac["start"]
+        parts = _event_participants(events, eff, tid, idx, a)
+        for did in parts:
+            dr_intervals[did].append((st, en, tid, idx))
+    for did, ivs in dr_intervals.items():
+        ivs.sort()
+        for x, y in zip(ivs, ivs[1:]):
+            if x[1] > y[0]:   # 半开区间：背靠背交接（前动作结束=后动作开始）不冲突
+                dname = dressers[did]["name"] if did in dressers else f"#{did}"
+                anomalies.append({"type": "concurrency", "task_id": y[2],
+                                  "action_idx": y[3], "time": y[0],
+                                  "message": f"服装师并发冲突：{dname} 在任务#{x[2]}动作{x[3]} "
+                                             f"({fmt(x[0])}-{fmt(x[1])}) 尚未结束，"
+                                             f"已参与任务#{y[2]}动作{y[3]}"})
+
+    # 2c) 实际参与者对照冻结分工：缺人/换人（含中途换手记录）
+    for a in plan["actions"]:
+        if not a.get("required"):
+            continue
+        tid, idx = a["task_id"], a["idx"]
+        ac = actuals.get((tid, idx), {})
+        if ac.get("start") is None or ac.get("skipped"):
+            continue
+        parts = _event_participants(events, eff, tid, idx, a)
+        plan_ids = set(a.get("staff_ids") or [])
+        actual_ids = set(parts)
+        if len(parts) < a["required"]:
+            anomalies.append({"type": "staff", "task_id": tid, "action_idx": idx,
+                              "time": ac["start"],
+                              "message": f"人手不足：动作{idx}「{a['label']}」需 "
+                                         f"{a['required']} 人，实际登记 "
+                                         f"{len(parts)} 人（{_names(parts, dressers)}）"})
+        extra = actual_ids - plan_ids
+        if plan_ids and extra:
+            anomalies.append({"type": "staff", "task_id": tid, "action_idx": idx,
+                              "time": ac["start"],
+                              "message": f"分工不符：动作{idx}「{a['label']}」"
+                                         f"{_names(extra, dressers)} 不在冻结分工"
+                                         f"（{_names(plan_ids, dressers)}）中"})
     for pid, pos in positions.items():
         pts = []
         for tid, (s, e) in intervals.items():
@@ -385,9 +478,17 @@ def _deviation_chain(plan, actuals, intervals, tasks, items, dressers, positions
     for t in plan["tasks"]:
         rs = [("actor", t["actor_id"],
                f"演员{actors[t['actor_id']]['name']}")]
-        if t["dresser_id"]:
-            rs.append(("dresser", t["dresser_id"],
-                       f"服装师{dressers[t['dresser_id']]['name']}"))
+        # 服装师按动作冻结分工聚合（同一任务可能中途换手给多名服装师）
+        dr_ids = []
+        for a in plan["actions"]:
+            if a["task_id"] != t["id"]:
+                continue
+            for did in (a.get("staff_ids") or []):
+                if did not in dr_ids:
+                    dr_ids.append(did)
+        for did in dr_ids:
+            dname = dressers[did]["name"] if did in dressers else f"#{did}"
+            rs.append(("dresser", did, f"服装师{dname}"))
         if t["position_id"]:
             rs.append(("position", t["position_id"],
                        f"换装位{positions[t['position_id']]['name']}"))
@@ -488,13 +589,13 @@ def summarize_suggestions(state, production_id=1, revision_id=None):
     runs = [r for r in db.list_runs(production_id) if r["status"] == "done"]
     if revision_id is not None:
         runs = [r for r in runs if r["revision_id"] == revision_id]
-    groups = {}          # (item_id, kind, dresser_id|None) -> [dur]
+    # (item_id, kind, 冻结分工整组) -> [dur]；无分工的旧连排按 (0,)（自助）
+    groups = {}
     dresser_names = {}
     for r in runs:
         plan = load_plan(db.get_run(r["id"]))
         events = db.run_events(r["id"])
         eff = effective_events(events)
-        tasks = {t["id"]: t for t in plan["tasks"]}
         for d in plan["dressers"]:
             dresser_names[d["id"]] = d["name"]
         for a in plan["actions"]:
@@ -507,8 +608,8 @@ def summarize_suggestions(state, production_id=1, revision_id=None):
             dur = ev_d["at_sec"] - ev_s["at_sec"]
             if not 0 < dur < 900:
                 continue
-            dr = tasks[a["task_id"]]["dresser_id"]   # 完整人员配置：具体服装师/自助
-            groups.setdefault((a["item_id"], a["kind"], dr), []).append(dur)
+            ids = tuple(sorted(a.get("staff_ids") or [])) or (0,)
+            groups.setdefault((a["item_id"], a["kind"], ids), []).append(dur)
 
     if revision_id is not None:
         rev = db.get_revision(revision_id)
@@ -517,8 +618,8 @@ def summarize_suggestions(state, production_id=1, revision_id=None):
     else:
         items = {i["id"]: i for i in state["items"]}
     out = []
-    for (iid, kind, dr), samples in sorted(groups.items(),
-                                           key=lambda x: (x[0][0], x[0][1], x[0][2] or 0)):
+    for (iid, kind, ids), samples in sorted(groups.items(),
+                                            key=lambda x: (x[0][0], x[0][1], x[0][2])):
         it = items.get(iid)
         if not it:
             continue
@@ -527,12 +628,22 @@ def summarize_suggestions(state, production_id=1, revision_id=None):
         suggested = int(math.ceil(_p75(samples)))
         if suggested == current:
             continue
+        real_ids = [i for i in ids if i]
+        names = [dresser_names.get(i, f"#{i}") for i in real_ids]
+        # 单人/自助沿用旧键格式 item:kind:dresser_id；多人协作用 id-id
+        key_tail = (str(real_ids[0]) if len(real_ids) == 1
+                    else ("-".join(str(i) for i in real_ids) if real_ids else "0"))
+        key = f"{iid}:{kind}:{key_tail}"
         out.append({
-            "key": f"{iid}:{kind}:{dr or 0}",
+            "key": key,
             "item_id": iid, "item_name": it["name"],
-            "action": kind, "dresser_id": dr,
-            "dresser_name": dresser_names.get(dr) if dr else None,
-            "staffed": dr is not None,
+            "action": kind,
+            "dresser_ids": real_ids,
+            "dresser_id": real_ids[0] if len(real_ids) == 1 else None,
+            "dresser_names": names,
+            "dresser_name": names[0] if len(names) == 1 else None,
+            "staff_label": "、".join(names) if names else "自助",
+            "staffed": bool(real_ids),
             "current": current, "suggested": suggested,
             "n": len(samples), "min": min(samples), "max": max(samples),
         })
@@ -542,16 +653,28 @@ def summarize_suggestions(state, production_id=1, revision_id=None):
 def derive_revision(run_id, accepted_keys, production_id=1):
     """从所选连排的基准修订派生新修订：建议写回冻结服装用时 → 在冻结方案上
     重排 → 只把受影响任务（窗口开始变化）的开始时刻写回快照，锁定节点不动。
-    全程不读写当前可变方案（scenes/tasks/items 表），产物仅为一个新修订。"""
+    计算所需的全部方案状态（含造型、造型-服装关系等辅助表）都来自冻结基准
+    （修订快照，或连排开启时冻结的 plan），全程不读当前可变表。"""
     run = db.get_run(run_id)
     if not run:
         return None
     rev = db.get_revision(run["revision_id"])
     if not rev:
         return None
-    snap = json.loads(rev["snapshot"])          # 冻结基准：scenes/tasks/items
-    state = db.load_state(production_id)        # 仅取辅助数据（造型/人员/位置/服装车）
-    sugg = summarize_suggestions(state, production_id, revision_id=rev["id"])
+    snap = json.loads(rev["snapshot"])          # 冻结基准：scenes/tasks/items(+辅助表)
+    plan = load_plan(run)                       # 连排开启时冻结的完整状态
+    # 辅助状态：优先修订快照（新版），缺失时回退连排冻结 plan；两者都缺则拒绝，
+    # 绝不回读当前可变表（look_items 等可能已漂移）。
+    aux = {}
+    for k in AUX_KEYS:
+        if snap.get(k) is not None:        # 注意：空列表是合法状态（如无服装车）
+            aux[k] = snap[k]
+        elif plan.get(k) is not None:
+            aux[k] = plan[k]
+        else:
+            return None
+    sugg = summarize_suggestions({"items": snap["items"]}, production_id,
+                                 revision_id=rev["id"])
     chosen = [s for s in sugg if s["key"] in set(accepted_keys)]
     if not chosen:
         return None
@@ -563,9 +686,8 @@ def derive_revision(run_id, accepted_keys, production_id=1):
             best[k] = s
 
     def frozen_state(items):
-        st = dict(state)
-        st["scenes"], st["tasks"], st["items"] = snap["scenes"], snap["tasks"], items
-        return st
+        return {"scenes": snap["scenes"], "tasks": snap["tasks"],
+                "items": items, **aux}
 
     old = scheduler.compute_schedule(frozen_state(snap["items"]))
     new_items = [dict(i) for i in snap["items"]]
@@ -589,7 +711,7 @@ def derive_revision(run_id, accepted_keys, production_id=1):
     names = "、".join(s["item_name"] for s in best.values())
     note = (f"连排#{run_id} 基准派生（修订#{rev['id']}）：调整 {len(best)} 项服装用时"
             f"（{names}），重排 {moved} 个受影响任务（已锁未动）")
-    new_snap = {"scenes": snap["scenes"], "tasks": new_tasks, "items": new_items}
+    new_snap = {"scenes": snap["scenes"], "tasks": new_tasks, "items": new_items, **aux}
     rev_id = db.save_snapshot_revision(new_snap, note, production_id)
     return {"revision_id": rev_id, "moved": moved, "note": note,
             "applied": list(best.values())}

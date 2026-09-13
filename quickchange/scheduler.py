@@ -1,12 +1,20 @@
 """快速换装排程引擎。
 
-计入：动作先后（脱外层→脱内层→穿内层→穿外层→取道具）、人员并发
-（演员/服装师同一时刻只能做一个动作）、换装位容量、步行时间、
-服装复用（一件服装被多人依次使用）以及清洁/维修状态。
+计入：动作先后（脱外层→脱内层→穿内层→穿外层→取道具）、动作级人员并发
+（演员/服装师在同一时刻只能参与一个动作）、双人同步（动作所需人数）、
+动作交接（相邻动作可由不同服装师负责，含跨侧台步行）、换装位容量、
+步行时间、技能/侧台资格、服装师不可用时段、服装复用（一件服装被多人
+依次使用）以及清洁/维修状态。
 
 资源模型：演员、服装师、换装位、服装副本均为「区间日历」。
 任务按期望开始时刻的先后顺序排程；已锁任务保留在自己的固定时段，
 只占用该时段内的资源，不会预先挤占更早任务的资源。
+
+服装师分工按动作登记（action_staff）：每个穿脱动作可要求技能与人数、
+指定固定负责人；人员需具备技能、支援动作所在侧台、且能从上一动作
+（或同侧上场口待命点）步行赶到。到岗过晚、技能不符、人数不足等都会
+定位到具体受阻动作。旧任务（无任何动作分工记录）退化为整段负责人
+（tasks.dresser_id），保持既有行为。
 
 服装副本自穿上动作起持续占用，直到对应的脱下动作结束；
 若没有脱下记录，则占用到演员穿着该件的场次结束。
@@ -73,20 +81,29 @@ def build_actions(task, state):
     props = [i for i in don if i["kind"] == "prop"]
     don_wear = [i for i in don if i["kind"] != "prop"]
 
-    acts = [{"kind": "walk", "label": "退场→换装位", "dur": walk_sec(exit_pt, pos_pt)}]
+    acts = [{"kind": "walk", "label": "退场→换装位", "dur": walk_sec(exit_pt, pos_pt),
+             "item_id": None, "seq": 0}]
+    seq_n = defaultdict(int)
     for it in doff:
         acts.append({"kind": "doff", "label": f"脱·{it['name']}", "dur": it["doff_sec"],
-                     "item_id": it["id"], "needs_dresser": it["kind"] != "prop"})
+                     "item_id": it["id"], "needs_dresser": it["kind"] != "prop",
+                     "seq": seq_n["doff"]})
+        seq_n["doff"] += 1
     for it in don_wear:
         acts.append({"kind": "don", "label": f"穿·{it['name']}", "dur": it["don_sec"],
-                     "item_id": it["id"], "needs_dresser": True})
+                     "item_id": it["id"], "needs_dresser": True,
+                     "seq": seq_n["don"]})
+        seq_n["don"] += 1
     for it in props:
         cart = carts.get(it["cart_id"]) if it["cart_id"] else None
         cart_pt = (cart["x"], cart["y"]) if cart else pos_pt
         acts.append({"kind": "fetch", "label": f"取道具·{it['name']}",
                      "dur": walk_sec(pos_pt, cart_pt) * 2 + PROP_HANDLE_SEC,
-                     "item_id": it["id"], "needs_dresser": False})
-    acts.append({"kind": "walk", "label": "换装位→上场口", "dur": walk_sec(pos_pt, exit_pt)})
+                     "item_id": it["id"], "needs_dresser": False,
+                     "seq": seq_n["fetch"]})
+        seq_n["fetch"] += 1
+    acts.append({"kind": "walk", "label": "换装位→上场口", "dur": walk_sec(pos_pt, exit_pt),
+                 "item_id": None, "seq": 1})
 
     window = {
         "ready": from_sc["start_sec"] + from_sc["duration_sec"],  # 演员退出上一场
@@ -100,6 +117,171 @@ def _scene_end(state, scene_id):
         if s["id"] == scene_id:
             return s["start_sec"] + s["duration_sec"]
     return 0
+
+
+# ---------------- 动作级分工 ----------------
+
+def action_key(a):
+    """动作定位键：(kind, item_id, seq)。walk/fetch 的 item_id 为 None。"""
+    return (a["kind"], a.get("item_id"), a.get("seq", 0))
+
+
+def _staffing_maps(state):
+    """规格/分工/资格索引。返回 (spec_by, staff_by, dressers, skills,
+    dresser_sk, dresser_sides, unavail)。"""
+    skills = _index(state.get("skills", []))
+    dressers = _index(state.get("dressers", []))
+    dresser_sk = defaultdict(set)
+    for r in state.get("dresser_skills", []):
+        dresser_sk[r["dresser_id"]].add(r["skill_id"])
+    dresser_sides = defaultdict(set)
+    for r in state.get("dresser_sides", []):
+        dresser_sides[r["dresser_id"]].add(r["side"])
+    unavail = defaultdict(list)
+    for r in state.get("dresser_unavailable", []):
+        unavail[r["dresser_id"]].append((r["start_sec"], r["end_sec"]))
+    for v in unavail.values():
+        v.sort()
+    spec_by = {}
+    for sp in state.get("action_specs", []):
+        spec_by[(sp["task_id"], sp["kind"], sp["item_id"], sp["seq"])] = sp
+    staff_by = defaultdict(list)
+    for st in state.get("action_staff", []):
+        staff_by[(st["task_id"], st["kind"], st["item_id"], st["seq"])].append(st)
+    for v in staff_by.values():
+        v.sort(key=lambda s: (not s["is_lead"], s["id"]))
+    return (spec_by, staff_by, dressers, skills, dresser_sk,
+            dresser_sides, unavail)
+
+
+def action_requirement(state, t, a, maps):
+    """某动作的 (所需技能id, 所需人数)：显式 action_specs 优先，
+    其次服装默认技能与默认人数（穿/脱 1 人、步行/取道具 0 人）。"""
+    spec_by, staff_by, dressers, skills, *_ = maps
+    sp = spec_by.get((t["id"], a["kind"], a.get("item_id"), a.get("seq", 0)))
+    if sp:
+        return sp["skill_id"], max(1, sp["required_count"])
+    skill = None
+    if a["kind"] in ("don", "doff"):
+        it = next((i for i in state["items"] if i["id"] == a.get("item_id")), None)
+        if it:
+            skill = it.get("skill_id")
+    if a["kind"] in ("don", "doff") and a.get("needs_dresser", False):
+        return skill, 1
+    return skill, 0
+
+
+def resolve_staffing(state, t, a, maps, overrides=None):
+    """解析某动作的计划分工。
+
+    返回 dict：{required_skill, required, ids(去重有序，负责人在前),
+    lead_id, locked(分工已锁), legacy(旧任务按整段负责人回退)}。
+    overrides: {action_key: [dresser_id,...]} 试算替代排法，不写库。
+    """
+    spec_by, staff_by, dressers, skills, *_ = maps
+    overrides = overrides or {}
+    key = action_key(a)
+    required_skill, required = action_requirement(state, t, a, maps)
+    rows = staff_by.get((t["id"],) + key, [])
+    ids, staff_locked, legacy = [], any(s["locked"] for s in rows), False
+    if key in overrides:
+        seen = set()
+        ids = [x for x in overrides[key]
+               if x is not None and x in dressers and not (x in seen or seen.add(x))]
+    elif rows:
+        seen = set()
+        for s in rows:
+            if s["dresser_id"] in dressers and s["dresser_id"] not in seen:
+                seen.add(s["dresser_id"])
+                ids.append(s["dresser_id"])
+    elif t.get("dresser_id") and a["kind"] in ("don", "doff"):
+        # 旧任务：整段负责人照看全部穿/脱动作
+        ids, legacy = [t["dresser_id"]], True
+        if required == 0:
+            required = 1
+    if required == 0 and ids:
+        required = len(ids)
+    lead_id = next((s["dresser_id"] for s in rows if s["is_lead"]
+                    and s["dresser_id"] in dressers), None)
+    if lead_id is None and ids:
+        lead_id = ids[0]
+    return {"required_skill": required_skill, "required": required,
+            "ids": ids, "lead_id": lead_id, "locked": staff_locked,
+            "legacy": legacy}
+
+
+def staffing_violations(state, t, a, staff, maps):
+    """静态资格问题（不靠顺延解决）：技能不符 / 不支援该侧 / 人数不足 /
+    重复登记。返回冲突描述列表。"""
+    _, _, dressers, skills, dresser_sk, dresser_sides, _ = maps
+    out = []
+    side = action_side(t, a, state)
+    if len(staff["ids"]) != len(set(staff["ids"])):
+        out.append("同一名服装师被重复登记")
+    for did in staff["ids"]:
+        d = dressers.get(did)
+        if not d:
+            out.append(f"服装师#{did} 不存在")
+            continue
+        sides = dresser_sides.get(did)
+        if sides and side not in sides:
+            out.append(f"{d['name']}不支援{('左' if side == 'L' else '右')}侧台")
+        if staff["required_skill"] and staff["required_skill"] not in dresser_sk.get(did, set()):
+            sk = skills.get(staff["required_skill"])
+            out.append(f"{d['name']}不具备技能「{sk['name'] if sk else '#'+str(staff['required_skill'])}」")
+    if staff["required"] and len(staff["ids"]) < staff["required"]:
+        out.append(f"人数不足：需 {staff['required']} 人，实际 {len(staff['ids'])} 人")
+    return out
+
+
+def action_side(t, a, state):
+    """动作所在侧台：换装位所在侧；未指定换装位时按退场口。"""
+    pos = next((p for p in state["positions"] if p["id"] == t.get("position_id")), None)
+    return pos["side"] if pos else t["exit_side"]
+
+
+def point_of_action(t, a, state, positions):
+    """动作发生点（米）：换装动作在换装位；walk=1 从换装位走向上场口，
+    取上场口；fetch 往返取换装位。"""
+    pos = positions.get(t.get("position_id"))
+    if a["kind"] == "walk" and a.get("seq") == 1:
+        return EXITS.get(t["exit_side"], EXITS["L"])
+    return (pos["x"], pos["y"]) if pos else EXITS.get(t["exit_side"], EXITS["L"])
+
+
+def dresser_ready(dr_id, start, dur, action_pt, busy, unavail, maps, limit=40):
+    """服装师从 start 起最早可执行 [?, ?+dur) 的时刻。
+
+    busy: 该服装师已提交区间 [(s,e,label,end_point),...]；
+    unavail: 不可用时段 [(u0,u1),...]；
+    衔接上一动作需从其结束点步行到本动作点（跨侧台按上场口间距离）。
+    返回 (ready, blocker|None, prev_end)。
+    """
+    cur = start
+    blocker = None
+    prev_end = None
+    for _ in range(limit):
+        pushed = False
+        for iv in busy:
+            s, e = iv[0], iv[1]
+            if s < cur + dur and e > cur:
+                end_pt = iv[3] if len(iv) > 3 and iv[3] else None
+                walk = walk_sec(end_pt, action_pt) if end_pt else 0
+                nxt = e + walk
+                if nxt > cur:
+                    cur, blocker, prev_end = nxt, iv, e
+                    pushed = True
+                    break
+        if pushed:
+            continue
+        for u0, u1 in unavail:
+            if u0 < cur + dur and u1 > cur:
+                cur, blocker, prev_end = max(cur, u1), ("unavail", u1, "不可用时段"), u1
+                pushed = True
+                break
+        if not pushed:
+            break
+    return cur, blocker, prev_end
 
 
 # ---------------- 服装穿着区间 ----------------
@@ -249,14 +431,19 @@ def compute_schedule(state, overrides=None):
     scenes = _index(state["scenes"])
     items = _index(state["items"])
     positions = _index(state["positions"])
+    maps = _staffing_maps(state)
+    staff_ov = overrides.get("__staff__", {})
 
     tasks = []
     for t in state["tasks"]:
         t = dict(t)
         ov = overrides.get(t["id"])
         if ov:
-            t.update({k: v for k, v in ov.items() if v is not None})
+            t.update({k: v for k, v in ov.items()
+                      if k in ("start_sec", "position_id", "dresser_id") and v is not None})
         acts, win = build_actions(t, state)
+        # 试算替代分工：{action_key: [dresser_id,...]}（键按当前任务解析）
+        t["_staff_ov"] = {k[1:]: v for k, v in staff_ov.items() if k and k[0] == t["id"]}
         t["_acts"] = acts
         t["_win"] = win
         if t["locked"] and t["start_sec"] is not None:
@@ -276,7 +463,7 @@ def compute_schedule(state, overrides=None):
     result = None
     for _ in range(12):
         result = _schedule_once(state, tasks, tasks_by_id, scenes, items,
-                                positions, segs, doff_actuals)
+                                positions, segs, doff_actuals, maps)
         new_actuals = {(a["task_id"], a["item_id"]): a["end"]
                        for a in result["actions"]
                        if a["kind"] == "doff" and a.get("item_id") is not None}
@@ -330,11 +517,15 @@ def _iv_task_id(iv):
 
 
 def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
-                   doff_actuals):
-    """单轮排程。doff_actuals: {(task_id,item_id): 实际脱下结束时刻}（上一轮结果）。"""
+                   doff_actuals, maps):
+    """单轮排程。doff_actuals: {(task_id,item_id): 实际脱下结束时刻}（上一轮结果）。
 
+    人员占用按动作登记：dresser_busy[d] = [(s,e,task_id,end_point,action_key)]，
+    下一动作者需从上一动作结束点步行赶到本动作点（跨侧台计入步行时间）。
+    """
+    (_, _, dressers, skills, dresser_sk, dresser_sides, unavail) = maps
     actor_busy = defaultdict(list)     # actor_id -> [(s,e,task_id)]
-    dresser_busy = defaultdict(list)   # dresser_id -> [(s,e,task_id)]
+    dresser_busy = defaultdict(list)   # dresser_id -> [(s,e,tid,end_pt,key)]
     pos_busy = defaultdict(list)       # position_id -> [(s,e,task_id)]
 
     # 服装副本日历：清洁/维修不可用区间 + 开场前已穿着的区间
@@ -381,17 +572,20 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
         tid = t["id"]
         aid = t["actor_id"]
         win = t["_win"]
-        s = t["_desired"]
-        delay_notes = []
-        item_wait_notes = []
+        s0 = t["_desired"]
+        staff_notes, item_wait_notes, staff_arrival_notes = [], [], []
         laid = None
-        for _ in range(80):
-            # 1) 顺序布局动作；穿上动作须在 [开始, 释放点) 全程有可用副本
-            item_wait_notes = []
-            cur = s
+        for _try in range(80):
+            # 1) 顺序布局：依次检查副本、演员、每位参与者的到岗/不可用/步行
+            item_wait_notes, staff_arrival_notes = [], []
+            static_notes, static_ok = [], True
+            cur = s0
             laid = []
-            for a in t["_acts"]:
-                a = dict(a)
+            max_shift = 0
+            for a0 in t["_acts"]:
+                a = dict(a0)
+                a["action_idx"] = len(laid)
+                key = action_key(a)
                 a["start"] = cur
                 if a["kind"] == "don" and a.get("item_id") is not None:
                     iid = a["item_id"]
@@ -403,56 +597,110 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
                         # 提交阶段若仍无法全程分配则拒绝（不产生重复分配）
                         t2 = _copy_gap_dur(copies[iid], cur, a["dur"])
                         item_wait_notes.append({
-                            "type": "item", "task_id": tid, "time": t2,
-                            "message": f"缺件：{a['label']} 穿着期间无连续可用副本"})
+                            "type": "item", "task_id": tid, "action_idx": len(laid),
+                            "time": t2, "message": f"缺件：{a['label']} 穿着期间无连续可用副本"})
                         a["start"] = t2
                     elif t1 > cur:
                         why = "清洁/维修中" if it and it["status"] != "ok" \
                             else "复用等待（前一位演员尚未脱下）"
                         item_wait_notes.append({
-                            "type": "item", "task_id": tid, "time": t1,
-                            "message": f"缺件/复用冲突：{a['label']} 需等到 "
-                                       f"{fmt(t1)}（{why}）"})
+                            "type": "item", "task_id": tid, "action_idx": len(laid),
+                            "time": t1, "message": f"缺件/复用冲突：{a['label']} 需等到 "
+                                                   f"{fmt(t1)}（{why}）"})
                         a["start"] = t1
-                a["end"] = a["start"] + a["dur"]
-                cur = a["end"]
+                cur = a["start"]
+                a["end"] = cur + a["dur"]
+
+                staff = resolve_staffing(state, t, a, maps, overrides=t.get("_staff_ov"))
+                # 静态资格问题（不可顺延解决）：技能/侧台/人数
+                for m in staffing_violations(state, t, a, staff, maps):
+                    static_notes.append({
+                        "type": "staffing", "task_id": tid,
+                        "action_idx": a["action_idx"],
+                        "time": a["start"], "action_label": a["label"],
+                        "message": f"{a['label']}：{m}"})
+                if static_notes:
+                    static_ok = False
+
+                apt = point_of_action(t, a, state, positions)
+                # 每位参与者：动作级占用 / 不可用时段 / 跨侧台步行 → 集体到岗时刻
+                action_shift = 0
+                arrival_info = None
+                for did in staff["ids"]:
+                    ready, blocker, prev_end = dresser_ready(
+                        did, cur, a["dur"], apt, dresser_busy[did],
+                        unavail.get(did, []), maps)
+                    if ready > cur:
+                        if ready - cur > action_shift:
+                            action_shift = ready - cur
+                            arrival_info = (did, blocker, prev_end, ready)
+                if action_shift:
+                    did, blocker, prev_end, ready = arrival_info
+                    dname = dressers[did]["name"] if did in dressers else f"#{did}"
+                    if blocker and blocker[0] == "unavail":
+                        msg = (f"到岗过晚：{dname} 处于不可用时段至 {fmt(prev_end)}，"
+                               f"{a['label']} 最早 {fmt(ready)} 开始")
+                    elif blocker:
+                        bt = tasks_by_id.get(blocker[2])
+                        blabel = f"任务#{blocker[2]}"
+                        if bt:
+                            bkey = blocker[4] if len(blocker) > 4 else None
+                            ba = next((x for x in bt["_acts"] if action_key(x) == bkey), None)
+                            if ba:
+                                blabel = f"「{ba['label']}」"
+                        walk_n = ready - prev_end
+                        cross = f"，跨侧台步行 {walk_n}s" if walk_n else ""
+                        msg = (f"到岗过晚：{dname} 在 {fmt(prev_end)} 才结束{blabel}{cross}，"
+                               f"{a['label']} 最早 {fmt(ready)} 开始")
+                    else:
+                        msg = f"到岗过晚：{dname} 最早 {fmt(ready)} 到岗"
+                    staff_arrival_notes.append({
+                        "type": "arrival", "task_id": tid, "action_idx": len(laid),
+                        "time": ready, "action_label": a["label"], "message": msg})
+                    max_shift = max(max_shift, action_shift)
+                a["staff"] = staff
+                a["point"] = apt
                 laid.append(a)
+                cur = a["end"]
+            if not static_ok:
+                staff_notes = static_notes
+
             start, end = laid[0]["start"], laid[-1]["end"]
             occ_s, occ_e = laid[0]["end"], laid[-1]["start"]
             if t["locked"]:
                 # 锁定任务不移动：与其它占用的重叠只记录为冲突
                 blk = _overlap(actor_busy[aid], start, end)
                 if blk:
-                    delay_notes.append({"type": "actor", "task_id": tid, "time": start,
-                                        "message": f"锁定任务与任务#{blk[2]}的演员时间重叠"})
-                if t["dresser_id"]:
-                    blk = _overlap(dresser_busy[t["dresser_id"]], start, end)
-                    if blk:
-                        delay_notes.append({"type": "dresser", "task_id": tid, "time": start,
-                                            "message": f"锁定任务与任务#{blk[2]}争用服装师"})
+                    staff_arrival_notes.append({"type": "actor", "task_id": tid,
+                        "action_idx": 0, "time": start,
+                        "message": f"锁定任务与任务#{blk[2]}的演员时间重叠"})
+                for a in laid:
+                    for did in a["staff"]["ids"]:
+                        blk = _overlap2(dresser_busy[did], start, end)
+                        if blk:
+                            dn = dressers[did]["name"] if did in dressers else f"#{did}"
+                            staff_arrival_notes.append({
+                                "type": "arrival", "task_id": tid,
+                                "action_idx": a["action_idx"],
+                                "time": start,
+                                "message": f"锁定任务：{dn} 与任务#{blk[2]}的动作时间重叠"})
                 break
             blk = _overlap(actor_busy[aid], start, end)
             if blk:
-                s = max(s + 1, blk[1])
+                s0 = max(s0 + 1, blk[1])
                 continue
-            if t["dresser_id"]:
-                blk = _overlap(dresser_busy[t["dresser_id"]], start, end)
-                if blk:
-                    delay_notes.append({
-                        "type": "dresser", "task_id": tid, "time": blk[1],
-                        "message": f"服装师并发冲突：需等到 {fmt(blk[1])}"
-                                   f"（正照看任务#{blk[2]}）"})
-                    s = max(s + 1, blk[1])
-                    continue
+            if max_shift:
+                s0 += max_shift
+                continue
             if t["position_id"]:
                 cap = positions[t["position_id"]]["capacity"] \
                     if t["position_id"] in positions else 1
                 shift = _capacity_shift(pos_busy[t["position_id"]], cap, occ_s, occ_e)
                 if shift:
-                    delay_notes.append({"type": "position", "task_id": tid,
-                                        "time": occ_s + shift,
-                                        "message": f"换装位容量不足，顺延 {shift}s"})
-                    s += shift
+                    staff_arrival_notes.append({"type": "position", "task_id": tid,
+                        "action_idx": 0, "time": occ_s + shift,
+                        "message": f"换装位容量不足，顺延 {shift}s"})
+                    s0 += shift
                     continue
             break
 
@@ -461,13 +709,15 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
 
         # 2) 提交资源占用
         actor_busy[aid].append((start, end, tid))
-        if t["dresser_id"]:
-            dresser_busy[t["dresser_id"]].append((start, end, tid))
         if t["position_id"]:
             pos_busy[t["position_id"]].append((occ_s, occ_e, tid))
         item_commit_notes = []
         for a in laid:
             iid = a.get("item_id")
+            # 服装师动作级日历（区间结束点用于下一动作的步行衔接）
+            for did in a["staff"]["ids"]:
+                dresser_busy[did].append(
+                    (a["start"], a["end"], tid, a["point"], action_key(a)))
             if iid is None:
                 continue
             if a["kind"] == "don":
@@ -476,7 +726,8 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
                 if pick is None or not pick[1]:
                     # 无连续可用副本：拒绝分配，绝不放置交叠区间
                     item_commit_notes.append({
-                        "type": "item", "task_id": tid, "time": a["start"],
+                        "type": "item", "task_id": tid, "action_idx": a["action_idx"],
+                        "time": a["start"], "action_label": a["label"],
                         "message": f"缺件：{a['label']} 穿着期间无连续可用副本，未分配"})
                     continue
                 idx = pick[0]
@@ -486,9 +737,9 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
             elif a["kind"] == "doff":
                 it = items.get(iid)
                 extra = CLEAN_SEC if it and it["status"] == "cleaning" else 0
-                key = (aid, iid)
-                if key in worn:
-                    _, iv = worn.pop(key)
+                wkey = (aid, iid)
+                if wkey in worn:
+                    _, iv = worn.pop(wkey)
                     iv[1] = a["end"] + extra   # 副本实际释放时刻 = 脱下动作结束(+清洁)
                 # 无对应穿着记录（数据缺造型或该次穿上未分配）：不产生区间
 
@@ -500,61 +751,171 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
         windows[tid] = {"start": start, "end": end, "ready": win["ready"],
                         "deadline": win["deadline"], "ok": fail is None}
         if t["needs_review"]:
-            conflicts.append({"type": "review", "task_id": tid, "time": start,
-                              "message": "关联场次/道具有变更，待复核"})
-        conflicts.extend(delay_notes)
+            conflicts.append({"type": "review", "task_id": tid, "action_idx": 0,
+                              "time": start, "message": "关联场次/道具或人员资料有变更，待复核"})
+        conflicts.extend(staff_notes)
+        conflicts.extend(staff_arrival_notes)
         conflicts.extend(item_wait_notes)
         conflicts.extend(item_commit_notes)
         if fail:
             conflicts.append({
-                "type": "late", "task_id": tid, "time": fail["start"],
+                "type": "late", "task_id": tid,
+                "action_idx": laid.index(fail), "time": fail["start"],
+                "action_label": fail["label"],
                 "message": f"最早无法按时完成的动作：{fail['label']}"
                            f"（预计 {fmt(fail['end'])}，截止 {fmt(win['deadline'])}）"})
 
-    actions.sort(key=lambda a: (a["start"], a["task_id"]))
-    conflicts.sort(key=lambda c: (c["time"], c["task_id"]))
+    actions.sort(key=lambda a: (a["start"], a["task_id"], a["action_idx"]))
+    conflicts.sort(key=lambda c: (c["time"], c["task_id"], c.get("action_idx", 0)))
+    # 人员动作日历供泳道/交接/侧台图使用
+    dresser_intervals = {d: sorted(v, key=lambda iv: iv[0])
+                         for d, v in dresser_busy.items()}
     return {"actions": actions, "windows": windows, "conflicts": conflicts,
-            "copies": copies}
+            "copies": copies, "dresser_intervals": dresser_intervals}
+
+
+def _overlap2(ivs, s, e):
+    """开放区间相交（[a,b) 与 [b,c) 不算冲突，允许动作交接背靠背）。"""
+    for iv in ivs:
+        if iv[0] < e and iv[1] > s:
+            return iv
+    return None
 
 
 def suggest(state, max_options=3):
-    """针对冲突任务，试算改动较少的替代排法（不动已锁任务）。"""
+    """针对冲突，试算改动较少的替代排法（不动已锁任务/已锁分工）。
+
+    优先处理最早受阻动作：
+    - 换装位/开始时刻：枚举换装位与 ±15/30 秒顺延；
+    - 动作级分工冲突（技能不符/侧台/人数不足/到岗过晚/人员重叠）：
+      为受阻动作枚举合格服装师组合（含双人同步所需多人），
+      只动最少的动作分工。
+    """
     base = compute_schedule(state)
-    base_n = len([c for c in base["conflicts"] if c["type"] != "review"])
-    bad_tasks = sorted({c["task_id"] for c in base["conflicts"] if c["type"] in
-                        ("late", "dresser", "position", "item")})
-    if not bad_tasks:
+    blocking = [c for c in base["conflicts"]
+                if c["type"] in ("late", "dresser", "position", "item",
+                                 "staffing", "arrival")]
+    if not blocking:
         return []
+    base_n = len([c for c in base["conflicts"] if c["type"] != "review"])
+    bad_tasks = sorted({c["task_id"] for c in blocking},
+                       key=lambda tid: min(c["time"] for c in blocking
+                                           if c["task_id"] == tid))
     tasks = {t["id"]: t for t in state["tasks"]}
+    maps = _staffing_maps(state)
     suggestions = []
     for tid in bad_tasks:
         t = tasks[tid]
         if t["locked"]:
             continue
+        tconf = [c for c in blocking if c["task_id"] == tid]
+        earliest = min(tconf, key=lambda c: (c["time"], c.get("action_idx", 0)))
         best = None
-        for pos in state["positions"]:
-            for dr in ([None] + [d["id"] for d in state["dressers"]]):
-                for shift in (0, -15, -30, 15, 30):
-                    ov = {tid: {"position_id": pos["id"], "dresser_id": dr,
-                                "start_sec": max(0, (t["start_sec"] or _scene_end(state, t["from_scene_id"])) + shift)}}
-                    res = compute_schedule(state, overrides=ov)
-                    n_conf = len([c for c in res["conflicts"] if c["type"] != "review"])
-                    task_conf = len([c for c in res["conflicts"]
-                                     if c["task_id"] == tid and c["type"] != "review"])
-                    changes = int(pos["id"] != t["position_id"]) + int(dr != t["dresser_id"]) + int(shift != 0)
-                    score = (n_conf, changes)
-                    if best is None or score < best[0]:
-                        best = (score, {"task_id": tid,
-                                        "changes": {"position_id": pos["id"], "dresser_id": dr,
-                                                    "start_sec": ov[tid]["start_sec"]},
-                                        "remaining_conflicts": task_conf})
-            if best and best[0][0] == 0 and best[0][1] <= 1:
-                break
+
+        def consider(ov, changes, staff_changes=None):
+            nonlocal best
+            res = compute_schedule(state, overrides=ov)
+            n_conf = len([c for c in res["conflicts"] if c["type"] != "review"])
+            task_conf = len([c for c in res["conflicts"]
+                             if c["task_id"] == tid and c["type"] != "review"])
+            score = (n_conf, changes, task_conf)
+            cand = {"task_id": tid, "changes": changes,
+                    "staff_changes": staff_changes or [],
+                    "remaining_conflicts": task_conf,
+                    "reason": earliest.get("action_label", "") +
+                              ("：" + earliest["message"] if earliest["type"] in
+                               ("staffing", "arrival") else "")}
+            if best is None or score < best[0]:
+                best = (score, cand)
+
+        staff_types = {"staffing", "arrival", "dresser"}
+        if any(c["type"] in staff_types for c in tconf):
+            acts, win = build_actions(t, state)
+            # 只尝试最早受阻动作（及其同任务后续受阻动作）的分工替换
+            blocked_idxs = sorted({c.get("action_idx", 0) for c in tconf
+                                   if c["type"] in staff_types})
+            for bi in blocked_idxs[:2]:
+                if bi >= len(acts):
+                    continue
+                a = acts[bi]
+                staff = resolve_staffing(state, t, a, maps)
+                if staff["locked"]:
+                    continue
+                side = action_side(t, a, state)
+                eligible = [d["id"] for d in state["dressers"]
+                            if _eligible(d["id"], side, staff["required_skill"], maps)]
+                cur = staff["ids"]
+                need = max(staff["required"], 1)
+                # 固定负责人尽量保留；枚举合格组合（保留固定负责人优先）
+                combos = _staff_combos(eligible, need, keep=staff["lead_id"],
+                                       current=cur)
+                for ids in combos[:12]:
+                    ov = {"__staff__": {(tid,) + action_key(a): list(ids)}}
+                    changes = _staff_change_count(cur, ids)
+                    consider(ov, changes,
+                             [{"kind": a["kind"], "item_id": a.get("item_id"),
+                               "seq": a.get("seq", 0), "dresser_ids": list(ids)}])
+                if best and best[0][0] == 0:
+                    break
+
+        # 换装位/时刻维度（含旧版整段负责人：dresser_id 回退仍可试算）
+        positions = state["positions"] or [None]
+        for pos in positions:
+            pid = pos["id"] if pos else None
+            for shift in (0, -15, -30, 15, 30):
+                ov = {tid: {"position_id": pid,
+                            "start_sec": max(0, (t["start_sec"] or
+                                            _scene_end(state, t["from_scene_id"])) + shift)}}
+                changes = int(pid != t["position_id"]) + int(shift != 0)
+                consider(ov, changes)
         if best and best[0][0] < base_n:
             suggestions.append(best[1])
         if len(suggestions) >= max_options:
             break
     return suggestions
+
+
+def _eligible(dr_id, side, skill_id, maps):
+    _, _, dressers, skills, dresser_sk, dresser_sides, _ = maps
+    sides = dresser_sides.get(dr_id)
+    if sides and side not in sides:
+        return False
+    if skill_id and skill_id not in dresser_sk.get(dr_id, set()):
+        return False
+    return dr_id in dressers
+
+
+def _staff_combos(eligible, need, keep=None, current=None):
+    """按「与现状差异最小」排序的合格组合：
+    1) 现组合已合格；2) 保留固定负责人补齐；3) 其他合格人员（人数少的优先）。"""
+    import itertools
+    current = [c for c in (current or []) if c in eligible]
+    out, seen = [], set()
+
+    def add(ids):
+        ids = tuple(dict.fromkeys(ids))
+        if len(ids) < need or ids in seen:
+            return
+        seen.add(ids)
+        out.append(list(ids))
+
+    if len(set(current)) >= need:
+        add(current[:need])
+    if keep and keep in eligible:
+        rest = [d for d in eligible if d != keep]
+        for r in range(max(0, need - 1), min(len(rest), need - 1) + 1):
+            for combo in itertools.combinations(rest, r):
+                add((keep,) + combo)
+    for r in range(need, min(len(eligible), need + 1) + 1):
+        for combo in itertools.combinations(eligible, r):
+            add(combo)
+    out.sort(key=lambda ids: _staff_change_count(current, ids))
+    return out
+
+
+def _staff_change_count(old, new):
+    old, new = set(old or []), set(new or [])
+    return len(old.symmetric_difference(new))
 
 
 def fmt(sec):

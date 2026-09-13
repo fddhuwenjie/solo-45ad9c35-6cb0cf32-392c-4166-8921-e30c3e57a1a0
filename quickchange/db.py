@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS items(
   status TEXT NOT NULL DEFAULT 'ok',         -- ok | cleaning | repair
   available_at INTEGER NOT NULL DEFAULT 0,   -- 清洁/维修后可用的演出时刻(秒)
   cart_id INTEGER,
-  copies INTEGER NOT NULL DEFAULT 1
+  copies INTEGER NOT NULL DEFAULT 1,
+  skill_id INTEGER               -- 该服装穿/脱动作的默认所需技能
 );
 CREATE TABLE IF NOT EXISTS look_items(
   look_id INTEGER NOT NULL,
@@ -58,6 +59,55 @@ CREATE TABLE IF NOT EXISTS dressers(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   production_id INTEGER NOT NULL,
   name TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS skills(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL,
+  name TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dresser_skills(
+  dresser_id INTEGER NOT NULL,
+  skill_id INTEGER NOT NULL,
+  PRIMARY KEY(dresser_id, skill_id)
+);
+CREATE TABLE IF NOT EXISTS dresser_sides(
+  dresser_id INTEGER NOT NULL,
+  side TEXT NOT NULL,              -- L | R；无记录=两侧均可（旧数据兼容）
+  PRIMARY KEY(dresser_id, side)
+);
+CREATE TABLE IF NOT EXISTS dresser_unavailable(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL DEFAULT 1,
+  dresser_id INTEGER NOT NULL,
+  start_sec INTEGER NOT NULL,
+  end_sec INTEGER NOT NULL,
+  reason TEXT NOT NULL DEFAULT ''
+);
+-- 动作规格：某任务内具体穿/脱动作所需技能与人数；按 (kind,item_id,seq) 定位动作
+CREATE TABLE IF NOT EXISTS action_specs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL,
+  task_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,             -- don | doff | fetch | walk
+  item_id INTEGER,                -- walk 动作为 NULL
+  seq INTEGER NOT NULL DEFAULT 0, -- 同类动作序号（两条 walk：0 退场、1 上场）
+  skill_id INTEGER,
+  required_count INTEGER NOT NULL DEFAULT 1
+);
+CREATE UNIQUE INDEX IF NOT EXISTS action_specs_uidx
+  ON action_specs(task_id, kind, COALESCE(item_id, -1), seq);
+-- 动作分工：每行一个参与服装师；is_lead=固定负责人；locked=连排确认后冻结
+CREATE TABLE IF NOT EXISTS action_staff(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL,
+  task_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  item_id INTEGER,
+  seq INTEGER NOT NULL DEFAULT 0,
+  dresser_id INTEGER NOT NULL,
+  is_lead INTEGER NOT NULL DEFAULT 0,
+  locked INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS positions(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,6 +180,13 @@ def _migrate(con):
     for col in ("item_id", "copy_id"):
         if cols and col not in cols:
             con.execute(f"ALTER TABLE run_events ADD COLUMN {col} INTEGER")
+    # 实测参与者：实际参与该动作的服装师 id 列表（JSON）；NULL/空=按冻结分工
+    for col in ("dresser_ids",):
+        if cols and col not in cols:
+            con.execute(f"ALTER TABLE run_events ADD COLUMN {col} TEXT")
+    icols = {r["name"] for r in con.execute("PRAGMA table_info(items)")}
+    if icols and "skill_id" not in icols:
+        con.execute("ALTER TABLE items ADD COLUMN skill_id INTEGER")
     con.commit()
 
 
@@ -171,6 +228,15 @@ def load_state(production_id=1):
             "items": rows(con, "SELECT * FROM items WHERE production_id=?", (pid,)),
             "look_items": rows(con, "SELECT * FROM look_items"),
             "dressers": rows(con, "SELECT * FROM dressers WHERE production_id=?", (pid,)),
+            "skills": rows(con, "SELECT * FROM skills WHERE production_id=? ORDER BY id", (pid,)),
+            "dresser_skills": rows(con, "SELECT * FROM dresser_skills"),
+            "dresser_sides": rows(con, "SELECT * FROM dresser_sides"),
+            "dresser_unavailable": rows(con,
+                "SELECT * FROM dresser_unavailable WHERE production_id=? ORDER BY start_sec", (pid,)),
+            "action_specs": rows(con,
+                "SELECT * FROM action_specs WHERE production_id=? ORDER BY task_id,id", (pid,)),
+            "action_staff": rows(con,
+                "SELECT * FROM action_staff WHERE production_id=? ORDER BY task_id,id", (pid,)),
             "positions": rows(con, "SELECT * FROM positions WHERE production_id=?", (pid,)),
             "carts": rows(con, "SELECT * FROM carts WHERE production_id=?", (pid,)),
             "tasks": rows(con, "SELECT * FROM tasks WHERE production_id=? ORDER BY id", (pid,)),
@@ -178,18 +244,49 @@ def load_state(production_id=1):
         }
         look_ids = {l["id"] for l in state["looks"]}
         state["look_items"] = [li for li in state["look_items"] if li["look_id"] in look_ids]
+        dr_ids = {d["id"] for d in state["dressers"]}
+        state["dresser_skills"] = [r for r in state["dresser_skills"]
+                                   if r["dresser_id"] in dr_ids]
+        state["dresser_sides"] = [r for r in state["dresser_sides"]
+                                  if r["dresser_id"] in dr_ids]
         return state
     finally:
         con.close()
 
 
 def snapshot(production_id=1):
+    """排程所需的完整状态：场次/任务/服装 + 造型、造型-服装关系、人员、
+    换装位、服装车等辅助表。派生修订时据此重建冻结基准，不读当前可变表。
+    （restore 仍只恢复 scenes/tasks/items，保持既有行为。）"""
     con = connect()
     try:
+        pid = production_id
+        looks = rows(con, "SELECT * FROM looks WHERE production_id=?", (pid,))
+        look_ids = {l["id"] for l in looks}
+        dr_ids = {r["id"] for r in con.execute(
+            "SELECT id FROM dressers WHERE production_id=?", (pid,)).fetchall()}
         return {
-            "scenes": rows(con, "SELECT * FROM scenes WHERE production_id=?", (production_id,)),
-            "tasks": rows(con, "SELECT * FROM tasks WHERE production_id=?", (production_id,)),
-            "items": rows(con, "SELECT * FROM items WHERE production_id=?", (production_id,)),
+            "scenes": rows(con, "SELECT * FROM scenes WHERE production_id=?", (pid,)),
+            "tasks": rows(con, "SELECT * FROM tasks WHERE production_id=?", (pid,)),
+            "items": rows(con, "SELECT * FROM items WHERE production_id=?", (pid,)),
+            "looks": looks,
+            "look_items": [li for li in rows(con, "SELECT * FROM look_items")
+                           if li["look_id"] in look_ids],
+            "actors": rows(con, "SELECT * FROM actors WHERE production_id=?", (pid,)),
+            "dressers": rows(con, "SELECT * FROM dressers WHERE production_id=?", (pid,)),
+            "skills": rows(con, "SELECT * FROM skills WHERE production_id=? ORDER BY id", (pid,)),
+            "dresser_skills": [r for r in rows(con, "SELECT * FROM dresser_skills")
+                               if r["dresser_id"] in dr_ids],
+            "dresser_sides": [r for r in rows(con, "SELECT * FROM dresser_sides")
+                              if r["dresser_id"] in dr_ids],
+            "dresser_unavailable": rows(con,
+                "SELECT * FROM dresser_unavailable WHERE production_id=? ORDER BY start_sec", (pid,)),
+            "action_specs": rows(con,
+                "SELECT * FROM action_specs WHERE production_id=? ORDER BY task_id,id", (pid,)),
+            "action_staff": [r for r in rows(con,
+                "SELECT * FROM action_staff WHERE production_id=? ORDER BY task_id,id", (pid,))],
+            "positions": rows(con, "SELECT * FROM positions WHERE production_id=?", (pid,)),
+            "carts": rows(con, "SELECT * FROM carts WHERE production_id=?", (pid,)),
         }
     finally:
         con.close()
@@ -246,6 +343,31 @@ def restore_revision(rev_id):
                     f"INSERT INTO {table}(id,{','.join(cols)}) VALUES(?{',?'*len(cols)})",
                     [r["id"]] + [r[c] for c in cols],
                 )
+        # 动作级协作表：修订快照带冻结分工时一并恢复（旧修订无这些键则跳过）
+        for table in ("skills", "action_specs", "action_staff", "dresser_unavailable"):
+            if table not in snap:
+                continue
+            con.execute(f"DELETE FROM {table} WHERE production_id=?", (pid,))
+            for r in snap[table]:
+                cols = [c for c in r.keys() if c != "id"]
+                con.execute(
+                    f"INSERT INTO {table}(id,{','.join(cols)}) VALUES(?,{','.join('?' for _ in cols)})",
+                    [r.get("id")] + [r[c] for c in cols],
+                )
+        # 全局关联表（无 production_id）：按快照内服装师集合整体替换
+        for table in ("dresser_skills", "dresser_sides"):
+            if table not in snap:
+                continue
+            snap_dr_ids = {r["dresser_id"] for r in snap[table]}
+            if snap_dr_ids:
+                con.executemany(
+                    f"DELETE FROM {table} WHERE dresser_id=?",
+                    [(i,) for i in snap_dr_ids])
+            for r in snap[table]:
+                cols = list(r.keys())
+                con.execute(
+                    f"INSERT INTO {table}({','.join(cols)}) VALUES({','.join('?' for _ in cols)})",
+                    [r[c] for c in cols])
         con.commit()
         return True
     finally:
@@ -299,14 +421,16 @@ def close_run(run_id):
 
 
 def add_event(run_id, task_id, action_idx, kind, at_sec, reason="", supersedes=None,
-              item_id=None, copy_id=None):
+              item_id=None, copy_id=None, dresser_ids=None):
     con = connect()
     try:
         cur = con.execute(
             "INSERT INTO run_events(run_id,task_id,action_idx,kind,at_sec,reason,supersedes,"
-            "item_id,copy_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            "item_id,copy_id,dresser_ids,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (run_id, task_id, action_idx, kind, int(at_sec), reason, supersedes,
-             item_id, copy_id, time.time()))
+             item_id, copy_id,
+             json.dumps(sorted(set(dresser_ids)), ensure_ascii=False) if dresser_ids else None,
+             time.time()))
         con.commit()
         return cur.lastrowid
     finally:
