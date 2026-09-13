@@ -96,3 +96,38 @@ svg text { user-select: none; }
 .sumtab { border-collapse: collapse; width: 100%; margin-bottom: 8px; }
 .sumtab td, .sumtab th { border: 1px solid #e3e6ea; padding: 4px 8px; font-size: 12px; text-align: left; }
 .sumtab th { background: #f4f6f8; }
+
+/* 动作级协作 */
+.palette { display: flex; gap: 8px; flex-wrap: wrap; margin: 4px 0 6px; }
+.dchip { display: inline-flex; flex-direction: column; border: 1px solid #aed6f1; background: #eaf4fc;
+  border-radius: 5px; padding: 3px 9px; cursor: grab; font-size: 12px; line-height: 1.25; user-select: none; }
+.dchip:active { cursor: grabbing; }
+.dchip small { color: #5d6d7e; font-size: 10px; }
+#dresser-lanes { background: #fcfdff; border: 1px solid #eef1f5; border-radius: 4px; }
+.dlane-block { cursor: pointer; }
+
+#action-staff-rows { display: flex; flex-direction: column; gap: 4px; max-height: 320px; overflow: auto; }
+.arow { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; font-size: 11px;
+  border: 1px dashed #cfd8e3; border-radius: 5px; padding: 4px 6px; background: #fafbfc; }
+.arow.dropzone { border-style: dashed; }
+.arow.dragover { border-color: #2980b9; background: #eaf4fc; box-shadow: inset 0 0 0 1px #2980b9; }
+.arow.locked { background: #f4f6f7; border-color: #bdc3c7; border-style: solid; }
+.arow .atime { color: #888; width: 34px; }
+.arow .alabel { font-weight: 600; min-width: 78px; }
+.arow .alabel.reviewed { color: #d35400; }
+.achips { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+.achips.under { outline: 1px solid #e74c3c; border-radius: 4px; padding: 1px 3px; }
+.achip { background: #2980b9; color: #fff; border-radius: 10px; padding: 1px 8px; font-size: 10px;
+  cursor: pointer; user-select: none; }
+.achip.lead { background: #c0392b; }
+.achip.bad { background: #e74c3c; }
+button.mini { padding: 1px 6px; font-size: 10px; background: #95a5a6; }
+.arow select, .arow input { padding: 1px 3px; font-size: 10px; }
+.askill { width: 78px; }
+
+.pstaff { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+.pstaff label { font-size: 10px; background: #eef3f8; border-radius: 8px; padding: 0 6px; }
+.pstaff label.mismatch { background: #fdedec; color: #c0392b; }
+.eform .sides { display: flex; gap: 8px; font-size: 12px; margin: 3px 0; }
+.uflist { font-size: 11px; padding-left: 14px; margin: 4px 0; }
+.uflist a { color: #c0392b; text-decoration: none; margin-left: 4px; }

@@ -27,7 +27,7 @@ def fmt(sec):
 # 冻结基准必须自带，派生/回看时不得回读当前可变表。
 AUX_KEYS = ("looks", "look_items", "actors", "dressers", "positions", "carts",
             "skills", "dresser_skills", "dresser_sides", "dresser_unavailable",
-            "action_specs", "action_staff")
+            "action_specs", "action_staff", "action_reviews")
 
 
 # ---------------- 基准计划冻结 ----------------
@@ -65,6 +65,7 @@ def freeze_plan(state, snap):
                 "required_skill": st.get("required_skill"),
                 "staff_locked": bool(st.get("locked")),
                 "legacy_staff": bool(st.get("legacy")),
+                "needs_review": bool(a.get("needs_review")),
             })
     slim_items = [{"id": i["id"], "name": i["name"], "kind": i["kind"],
                    "copies": i["copies"], "don_sec": i["don_sec"],

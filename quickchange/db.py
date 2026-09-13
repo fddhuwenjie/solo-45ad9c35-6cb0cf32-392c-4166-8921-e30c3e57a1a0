@@ -109,6 +109,17 @@ CREATE TABLE IF NOT EXISTS action_staff(
   locked INTEGER NOT NULL DEFAULT 0,
   created_at REAL NOT NULL
 );
+-- 动作级待复核：人员资料/场次/服装变化只标记受影响动作（不整任务标红）
+CREATE TABLE IF NOT EXISTS action_reviews(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL DEFAULT 1,
+  task_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  item_id INTEGER,
+  seq INTEGER NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS positions(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   production_id INTEGER NOT NULL,
@@ -237,6 +248,8 @@ def load_state(production_id=1):
                 "SELECT * FROM action_specs WHERE production_id=? ORDER BY task_id,id", (pid,)),
             "action_staff": rows(con,
                 "SELECT * FROM action_staff WHERE production_id=? ORDER BY task_id,id", (pid,)),
+            "action_reviews": rows(con,
+                "SELECT * FROM action_reviews WHERE production_id=? ORDER BY id", (pid,)),
             "positions": rows(con, "SELECT * FROM positions WHERE production_id=?", (pid,)),
             "carts": rows(con, "SELECT * FROM carts WHERE production_id=?", (pid,)),
             "tasks": rows(con, "SELECT * FROM tasks WHERE production_id=? ORDER BY id", (pid,)),
@@ -285,6 +298,8 @@ def snapshot(production_id=1):
                 "SELECT * FROM action_specs WHERE production_id=? ORDER BY task_id,id", (pid,)),
             "action_staff": [r for r in rows(con,
                 "SELECT * FROM action_staff WHERE production_id=? ORDER BY task_id,id", (pid,))],
+            "action_reviews": rows(con,
+                "SELECT * FROM action_reviews WHERE production_id=? ORDER BY id", (pid,)),
             "positions": rows(con, "SELECT * FROM positions WHERE production_id=?", (pid,)),
             "carts": rows(con, "SELECT * FROM carts WHERE production_id=?", (pid,)),
         }

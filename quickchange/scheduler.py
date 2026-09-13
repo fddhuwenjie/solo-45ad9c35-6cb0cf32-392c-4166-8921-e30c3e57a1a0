@@ -150,8 +150,11 @@ def _staffing_maps(state):
         staff_by[(st["task_id"], st["kind"], st["item_id"], st["seq"])].append(st)
     for v in staff_by.values():
         v.sort(key=lambda s: (not s["is_lead"], s["id"]))
+    review_by = {}
+    for rv in state.get("action_reviews", []):
+        review_by[(rv["task_id"], rv["kind"], rv["item_id"], rv["seq"])] = rv
     return (spec_by, staff_by, dressers, skills, dresser_sk,
-            dresser_sides, unavail)
+            dresser_sides, unavail, review_by)
 
 
 def action_requirement(state, t, a, maps):
@@ -213,7 +216,7 @@ def resolve_staffing(state, t, a, maps, overrides=None):
 def staffing_violations(state, t, a, staff, maps):
     """静态资格问题（不靠顺延解决）：技能不符 / 不支援该侧 / 人数不足 /
     重复登记。返回冲突描述列表。"""
-    _, _, dressers, skills, dresser_sk, dresser_sides, _ = maps
+    _, _, dressers, skills, dresser_sk, dresser_sides, _, _rev = maps
     out = []
     side = action_side(t, a, state)
     if len(staff["ids"]) != len(set(staff["ids"])):
@@ -523,7 +526,8 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
     人员占用按动作登记：dresser_busy[d] = [(s,e,task_id,end_point,action_key)]，
     下一动作者需从上一动作结束点步行赶到本动作点（跨侧台计入步行时间）。
     """
-    (_, _, dressers, skills, dresser_sk, dresser_sides, unavail) = maps
+    (_, _, dressers, skills, dresser_sk, dresser_sides,
+     unavail, _review_by) = maps
     actor_busy = defaultdict(list)     # actor_id -> [(s,e,task_id)]
     dresser_busy = defaultdict(list)   # dresser_id -> [(s,e,tid,end_pt,key)]
     pos_busy = defaultdict(list)       # position_id -> [(s,e,task_id)]
@@ -573,7 +577,10 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
         aid = t["actor_id"]
         win = t["_win"]
         s0 = t["_desired"]
-        staff_notes, item_wait_notes, staff_arrival_notes = [], [], []
+        # 首次受阻根因：只记录第一次布局尝试时发现的问题。后续尝试通过顺延
+        # 解决冲突（最终布局无冲突），但根因要保留下来定位「最早受阻动作」。
+        root_staff_notes, root_item_notes, root_arrival_notes = [], [], []
+        root_capacity = None
         laid = None
         for _try in range(80):
             # 1) 顺序布局：依次检查副本、演员、每位参与者的到岗/不可用/步行
@@ -582,9 +589,11 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
             cur = s0
             laid = []
             max_shift = 0
+            record_root = _try == 0   # 根因只取期望时刻的首轮布局
             for a0 in t["_acts"]:
                 a = dict(a0)
-                a["action_idx"] = len(laid)
+                ai = len(laid)
+                a["action_idx"] = ai
                 key = action_key(a)
                 a["start"] = cur
                 if a["kind"] == "don" and a.get("item_id") is not None:
@@ -597,29 +606,37 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
                         # 提交阶段若仍无法全程分配则拒绝（不产生重复分配）
                         t2 = _copy_gap_dur(copies[iid], cur, a["dur"])
                         item_wait_notes.append({
-                            "type": "item", "task_id": tid, "action_idx": len(laid),
+                            "type": "item", "task_id": tid, "action_idx": ai,
                             "time": t2, "message": f"缺件：{a['label']} 穿着期间无连续可用副本"})
                         a["start"] = t2
+                        if record_root:
+                            root_item_notes.append(item_wait_notes[-1])
                     elif t1 > cur:
                         why = "清洁/维修中" if it and it["status"] != "ok" \
                             else "复用等待（前一位演员尚未脱下）"
                         item_wait_notes.append({
-                            "type": "item", "task_id": tid, "action_idx": len(laid),
+                            "type": "item", "task_id": tid, "action_idx": ai,
                             "time": t1, "message": f"缺件/复用冲突：{a['label']} 需等到 "
                                                    f"{fmt(t1)}（{why}）"})
                         a["start"] = t1
+                        if record_root:
+                            root_item_notes.append(item_wait_notes[-1])
                 cur = a["start"]
                 a["end"] = cur + a["dur"]
 
                 staff = resolve_staffing(state, t, a, maps, overrides=t.get("_staff_ov"))
                 # 静态资格问题（不可顺延解决）：技能/侧台/人数
-                for m in staffing_violations(state, t, a, staff, maps):
-                    static_notes.append({
+                vnotes = staffing_violations(state, t, a, staff, maps)
+                for m in vnotes:
+                    note = {
                         "type": "staffing", "task_id": tid,
                         "action_idx": a["action_idx"],
                         "time": a["start"], "action_label": a["label"],
-                        "message": f"{a['label']}：{m}"})
-                if static_notes:
+                        "message": f"{a['label']}：{m}"}
+                    static_notes.append(note)
+                    if record_root:
+                        root_staff_notes.append(note)
+                if vnotes:
                     static_ok = False
 
                 apt = point_of_action(t, a, state, positions)
@@ -655,15 +672,15 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
                     else:
                         msg = f"到岗过晚：{dname} 最早 {fmt(ready)} 到岗"
                     staff_arrival_notes.append({
-                        "type": "arrival", "task_id": tid, "action_idx": len(laid),
+                        "type": "arrival", "task_id": tid, "action_idx": ai,
                         "time": ready, "action_label": a["label"], "message": msg})
+                    if record_root:
+                        root_arrival_notes.append(staff_arrival_notes[-1])
                     max_shift = max(max_shift, action_shift)
                 a["staff"] = staff
                 a["point"] = apt
                 laid.append(a)
                 cur = a["end"]
-            if not static_ok:
-                staff_notes = static_notes
 
             start, end = laid[0]["start"], laid[-1]["end"]
             occ_s, occ_e = laid[0]["end"], laid[-1]["start"]
@@ -697,9 +714,12 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
                     if t["position_id"] in positions else 1
                 shift = _capacity_shift(pos_busy[t["position_id"]], cap, occ_s, occ_e)
                 if shift:
-                    staff_arrival_notes.append({"type": "position", "task_id": tid,
-                        "action_idx": 0, "time": occ_s + shift,
-                        "message": f"换装位容量不足，顺延 {shift}s"})
+                    note = {"type": "position", "task_id": tid,
+                            "action_idx": 0, "time": occ_s + shift,
+                            "message": f"换装位容量不足，顺延 {shift}s"}
+                    staff_arrival_notes.append(note)
+                    if record_root and root_capacity is None:
+                        root_capacity = note
                     s0 += shift
                     continue
             break
@@ -745,6 +765,17 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
 
         # 3) 截止检查：第一个超出截止时间的动作
         fail = next((a for a in laid if a["end"] > win["deadline"]), None)
+        action_review_notes = []
+        review_by = maps[7]
+        for a in laid:
+            rv = review_by.get((tid, a["kind"], a.get("item_id"), a.get("seq", 0)))
+            if rv:
+                a["needs_review"] = True
+                action_review_notes.append({
+                    "type": "action_review", "task_id": tid,
+                    "action_idx": a["action_idx"], "time": a["start"],
+                    "action_label": a["label"],
+                    "message": f"{a['label']}：{rv['reason'] or '相关资料变更，待复核'}"})
         for a in laid:
             a["task_id"] = tid
         actions.extend(laid)
@@ -752,15 +783,23 @@ def _schedule_once(state, tasks, tasks_by_id, scenes, items, positions, segs,
                         "deadline": win["deadline"], "ok": fail is None}
         if t["needs_review"]:
             conflicts.append({"type": "review", "task_id": tid, "action_idx": 0,
-                              "time": start, "message": "关联场次/道具或人员资料有变更，待复核"})
-        conflicts.extend(staff_notes)
-        conflicts.extend(staff_arrival_notes)
-        conflicts.extend(item_wait_notes)
+                              "time": start, "message": "关联场次/道具有变更，待复核"})
+        conflicts.extend(action_review_notes)
+        if t["locked"]:
+            # 锁定任务不移动：报本轮实际检测到的重叠
+            conflicts.extend(staff_arrival_notes)
+        else:
+            # 可移动任务：报首次受阻根因（最终布局已顺延时当前轮无冲突）
+            conflicts.extend(root_staff_notes)
+            conflicts.extend(root_arrival_notes)
+            if root_capacity:
+                conflicts.append(root_capacity)
+        conflicts.extend(root_item_notes)
         conflicts.extend(item_commit_notes)
         if fail:
             conflicts.append({
                 "type": "late", "task_id": tid,
-                "action_idx": laid.index(fail), "time": fail["start"],
+                "action_idx": fail["action_idx"], "time": fail["start"],
                 "action_label": fail["label"],
                 "message": f"最早无法按时完成的动作：{fail['label']}"
                            f"（预计 {fmt(fail['end'])}，截止 {fmt(win['deadline'])}）"})
@@ -798,7 +837,7 @@ def suggest(state, max_options=3):
     if not blocking:
         return []
     base_n = len([c for c in base["conflicts"] if c["type"] != "review"])
-    bad_tasks = sorted({c["task_id"] for c in blocking},
+    bad_tasks = sorted({c["task_id"] for c in blocking if c["task_id"]},
                        key=lambda tid: min(c["time"] for c in blocking
                                            if c["task_id"] == tid))
     tasks = {t["id"]: t for t in state["tasks"]}
@@ -806,77 +845,100 @@ def suggest(state, max_options=3):
     suggestions = []
     for tid in bad_tasks:
         t = tasks[tid]
-        if t["locked"]:
-            continue
         tconf = [c for c in blocking if c["task_id"] == tid]
         earliest = min(tconf, key=lambda c: (c["time"], c.get("action_idx", 0)))
         best = None
 
-        def consider(ov, changes, staff_changes=None):
+        def consider(ov, changes_dict, change_n, staff_changes=None):
             nonlocal best
             res = compute_schedule(state, overrides=ov)
             n_conf = len([c for c in res["conflicts"] if c["type"] != "review"])
             task_conf = len([c for c in res["conflicts"]
                              if c["task_id"] == tid and c["type"] != "review"])
-            score = (n_conf, changes, task_conf)
-            cand = {"task_id": tid, "changes": changes,
+            score = (n_conf, change_n, task_conf)
+            cand = {"task_id": tid, "changes": changes_dict,
                     "staff_changes": staff_changes or [],
                     "remaining_conflicts": task_conf,
-                    "reason": earliest.get("action_label", "") +
-                              ("：" + earliest["message"] if earliest["type"] in
-                               ("staffing", "arrival") else "")}
+                    "reason": (earliest["message"]
+                               if earliest["type"] in ("staffing", "arrival")
+                               else (earliest.get("action_label") or ""))}
             if best is None or score < best[0]:
                 best = (score, cand)
 
         staff_types = {"staffing", "arrival", "dresser"}
-        if any(c["type"] in staff_types for c in tconf):
-            acts, win = build_actions(t, state)
-            # 只尝试最早受阻动作（及其同任务后续受阻动作）的分工替换
-            blocked_idxs = sorted({c.get("action_idx", 0) for c in tconf
-                                   if c["type"] in staff_types})
-            for bi in blocked_idxs[:2]:
+        # 到岗/资格类受阻，或仅有超时（可能由跨侧台步行引起）：尝试换人
+        if any(c["type"] in staff_types for c in tconf) or \
+                all(c["type"] in ("late",) for c in tconf):
+            acts, _win = build_actions(t, state)
+            idxs = sorted({c.get("action_idx", 0) for c in tconf
+                           if c["type"] in staff_types})
+            if not idxs:
+                # 仅超时时：尝试全部需人动作里最早的
+                idxs = [i for i, a in enumerate(acts) if resolve_staffing(
+                    state, t, a, maps)["ids"]]
+            for bi in idxs[:2]:
                 if bi >= len(acts):
                     continue
                 a = acts[bi]
                 staff = resolve_staffing(state, t, a, maps)
-                if staff["locked"]:
+                if not staff["ids"] or staff["locked"]:
                     continue
                 side = action_side(t, a, state)
                 eligible = [d["id"] for d in state["dressers"]
-                            if _eligible(d["id"], side, staff["required_skill"], maps)]
+                            if _eligible(d["id"], side, staff["required_skill"], maps)
+                            and d["id"] not in staff["ids"]]
                 cur = staff["ids"]
-                need = max(staff["required"], 1)
-                # 固定负责人尽量保留；枚举合格组合（保留固定负责人优先）
+                need = max(staff["required"], len(cur), 1)
+                # 换人优先：保留固定负责人与其余搭档，只替换受阻的人；
+                # 其次枚举合格组合（人数不变，差异最小）。
                 combos = _staff_combos(eligible, need, keep=staff["lead_id"],
-                                       current=cur)
-                for ids in combos[:12]:
+                                       current=cur, prefer_current=True)
+                for ids in combos[:10]:
+                    if set(ids) == set(cur):
+                        continue
                     ov = {"__staff__": {(tid,) + action_key(a): list(ids)}}
-                    changes = _staff_change_count(cur, ids)
-                    consider(ov, changes,
+                    change_n = _staff_change_count(cur, ids)
+                    consider(ov, {}, change_n,
                              [{"kind": a["kind"], "item_id": a.get("item_id"),
                                "seq": a.get("seq", 0), "dresser_ids": list(ids)}])
                 if best and best[0][0] == 0:
                     break
 
-        # 换装位/时刻维度（含旧版整段负责人：dresser_id 回退仍可试算）
+        # 换装位/时刻维度（已锁任务不移动，只允许换人）
+        if t["locked"]:
+            if best:
+                suggestions.append(best[1])
+            if len(suggestions) >= max_options:
+                break
+            continue
         positions = state["positions"] or [None]
         for pos in positions:
-            pid = pos["id"] if pos else None
+            pid_ = pos["id"] if pos else None
+            base_start = t["start_sec"] if t["start_sec"] is not None \
+                else base["windows"].get(tid, {}).get("start") or \
+                _scene_end(state, t["from_scene_id"])
             for shift in (0, -15, -30, 15, 30):
-                ov = {tid: {"position_id": pid,
-                            "start_sec": max(0, (t["start_sec"] or
-                                            _scene_end(state, t["from_scene_id"])) + shift)}}
-                changes = int(pid != t["position_id"]) + int(shift != 0)
-                consider(ov, changes)
+                new_start = max(0, int(base_start) + shift)
+                changes = {"start_sec": new_start}
+                change_n = int(shift != 0)
+                if pid_ is not None and pid_ != t["position_id"]:
+                    changes["position_id"] = pid_
+                    change_n += 1
+                ov = {tid: {"position_id": pid_, "start_sec": new_start}}
+                consider(ov, changes, change_n)
         if best and best[0][0] < base_n:
             suggestions.append(best[1])
+        elif best and not any(s["task_id"] == tid for s in suggestions):
+            # 即便总冲突数没降（级联冲突），只要本任务冲突减少也给出
+            if best[1]["remaining_conflicts"] < len(tconf):
+                suggestions.append(best[1])
         if len(suggestions) >= max_options:
             break
     return suggestions
 
 
 def _eligible(dr_id, side, skill_id, maps):
-    _, _, dressers, skills, dresser_sk, dresser_sides, _ = maps
+    _, _, dressers, skills, dresser_sk, dresser_sides, _, _rev = maps
     sides = dresser_sides.get(dr_id)
     if sides and side not in sides:
         return False
@@ -885,29 +947,51 @@ def _eligible(dr_id, side, skill_id, maps):
     return dr_id in dressers
 
 
-def _staff_combos(eligible, need, keep=None, current=None):
-    """按「与现状差异最小」排序的合格组合：
-    1) 现组合已合格；2) 保留固定负责人补齐；3) 其他合格人员（人数少的优先）。"""
+def _staff_combos(eligible, need, keep=None, current=None, prefer_current=False):
+    """按「与现状差异最小」排序的合格组合。
+
+    prefer_current=True（换人）：只从非当前人员中挑替换者，
+    保留固定负责人与其余搭档；need 按当前人数补齐。
+    否则：1) 现组合已合格；2) 保留固定负责人补齐；3) 其他合格人员。
+    """
     import itertools
-    current = [c for c in (current or []) if c in eligible]
+    current = [c for c in (current or [])]
+    cur_set = set(current)
     out, seen = [], set()
 
     def add(ids):
-        ids = tuple(dict.fromkeys(ids))
+        ids = tuple(dict.fromkeys(int(x) for x in ids))
         if len(ids) < need or ids in seen:
             return
         seen.add(ids)
         out.append(list(ids))
 
-    if len(set(current)) >= need:
+    if prefer_current:
+        # 必须至少包含一名非现任者（真正换人）：保留 0..need-1 名现任，
+        # 其余从合格者补齐；保留时负责人优先。
+        free = list(dict.fromkeys(d for d in eligible if d not in cur_set))
+        ordered_cur = ([keep] if keep in cur_set else []) + \
+            [x for x in current if x != keep]
+        for n_keep in range(min(len(ordered_cur), need - 1), -1, -1):
+            for kept in itertools.combinations(ordered_cur, n_keep):
+                n_free = need - len(kept)
+                if n_free < 1 or len(free) < n_free:
+                    continue
+                for combo in itertools.combinations(free, n_free):
+                    add(tuple(kept) + combo)
+        out.sort(key=lambda ids: _staff_change_count(current, ids))
+        return out
+
+    eligible_all = list(dict.fromkeys(list(current) + list(eligible)))
+    if len(cur_set) >= need:
         add(current[:need])
-    if keep and keep in eligible:
-        rest = [d for d in eligible if d != keep]
+    if keep and keep in eligible_all:
+        rest = [d for d in eligible_all if d != keep]
         for r in range(max(0, need - 1), min(len(rest), need - 1) + 1):
             for combo in itertools.combinations(rest, r):
                 add((keep,) + combo)
-    for r in range(need, min(len(eligible), need + 1) + 1):
-        for combo in itertools.combinations(eligible, r):
+    for r in range(need, min(len(eligible_all), need + 1) + 1):
+        for combo in itertools.combinations(eligible_all, r):
             add(combo)
     out.sort(key=lambda ids: _staff_change_count(current, ids))
     return out

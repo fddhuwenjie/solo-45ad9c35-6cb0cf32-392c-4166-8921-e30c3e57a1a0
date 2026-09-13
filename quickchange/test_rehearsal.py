@@ -195,12 +195,13 @@ def test_concurrency_first_deviation_and_chain():
     client = _client()
     run_id = _make_run(client)
 
-    # 任务#1 实测整体晚 25s：[125,135]；任务#2 等不及王姐，133 就开工（区间交叠）
+    # 任务#1 实测整体晚 25s：[125,135]；任务#2 穿上动作 133 就开工，
+    # 与任务#1 穿上动作 [130,134) 真正重叠（背靠背交接不算冲突）
     seq1 = [(0, 125, 126), (1, 126, 130), (2, 130, 134), (3, 134, 135)]
     for idx, s, e in seq1:
         _punch(client, run_id, 1, idx, "start", s)
         _punch(client, run_id, 1, idx, "done", e)
-    seq2 = [(0, 133, 134), (1, 134, 138), (2, 138, 139)]
+    seq2 = [(0, 132, 133), (1, 133, 137), (2, 137, 138)]
     for idx, s, e in seq2:
         _punch(client, run_id, 2, idx, "start", s)
         _punch(client, run_id, 2, idx, "done", e)

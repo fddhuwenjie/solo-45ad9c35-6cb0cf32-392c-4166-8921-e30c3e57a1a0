@@ -14,7 +14,9 @@
     <span class="sep"></span>
     <span class="lbl">导出：</span>
     <select id="export-actor"></select>
-    <button id="btn-cue">个人提示单</button>
+    <button id="btn-cue">演员提示单</button>
+    <select id="export-dresser"></select>
+    <button id="btn-dresser-cue">服装师提示单</button>
     <button id="btn-flow">服装流转表</button>
     <button id="btn-svg">SVG时间线</button>
   </div>
@@ -24,6 +26,9 @@
   <section id="panel-timeline">
     <h2>场次时间轴 <span class="hint">拖动任务块调整开始时间；点击选中；选中连排后同轴叠放实测</span></h2>
     <svg id="timeline" width="1180" height="260"></svg>
+    <h3>人员泳道 <span class="hint">动作级分工与交接；把下方服装师拖到任务详情的具体动作上</span></h3>
+    <div id="dresser-palette" class="palette"></div>
+    <svg id="dresser-lanes" width="1180" height="120"></svg>
     <div id="conflicts"></div>
     <div id="suggestions"></div>
   </section>

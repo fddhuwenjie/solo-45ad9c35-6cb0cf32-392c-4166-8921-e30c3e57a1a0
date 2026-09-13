@@ -103,35 +103,39 @@ def api_task_update(tid):
     return jsonify(full_state())
 
 
-@app.post("/api/tasks/<int:tid>/clear_review")
-def api_clear_review(tid):
-    con = db.connect()
-    try:
-        con.execute("UPDATE tasks SET needs_review=0 WHERE id=?", (tid,))
-        con.commit()
-    finally:
-        con.close()
-    return jsonify(full_state())
-
-
 @app.post("/api/apply_suggestion")
 def api_apply_suggestion():
+    """统一建议格式：{task_id, changes:{start_sec?,position_id?},
+    staff_changes:[{kind,item_id,seq,dresser_ids}]}。
+    未提供的字段保持不变；已锁任务/已锁分工拒绝。"""
     data = request.get_json(force=True)
     tid = int(data["task_id"])
-    ch = data["changes"]
+    ch = data.get("changes") or {}
+    staff_changes = data.get("staff_changes", [])
     con = db.connect()
     try:
-        cur = con.execute("SELECT locked FROM tasks WHERE id=?", (tid,)).fetchone()
-        if cur and cur["locked"]:
+        cur = con.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+        if not cur:
+            return jsonify({"ok": False, "error": "任务不存在"}), 404
+        # 任务时间锁只阻挡时刻/换装位改动；纯换人由动作分工锁（下）单独把关
+        if cur["locked"] and ("start_sec" in ch or "position_id" in ch):
             return jsonify({"ok": False, "error": "已锁节点不得移动"}), 409
         # 动作级分工替代排法（不动已锁分工）
-        for sc in data.get("staff_changes", []):
+        for sc in staff_changes:
             if _staff_row_locked(con, tid, sc["kind"], sc.get("item_id"), sc.get("seq", 0)):
                 return jsonify({"ok": False, "error": "该动作分工已锁，不能替换"}), 409
             _replace_action_staff(con, tid, sc["kind"], sc.get("item_id"),
                                   sc.get("seq", 0), sc.get("dresser_ids", []), PID)
-        con.execute("UPDATE tasks SET position_id=?, dresser_id=?, start_sec=? WHERE id=?",
-                    (ch.get("position_id"), ch.get("dresser_id"), ch.get("start_sec"), tid))
+        sets, args = [], []
+        if "start_sec" in ch:
+            sets.append("start_sec=?")
+            args.append(ch["start_sec"])
+        if "position_id" in ch:
+            sets.append("position_id=?")
+            args.append(ch["position_id"])
+        if sets:
+            args.append(tid)
+            con.execute(f"UPDATE tasks SET {','.join(sets)} WHERE id=?", args)
         con.commit()
     finally:
         con.close()
@@ -225,11 +229,13 @@ def api_action_staff(tid):
             "AND COALESCE(item_id,-1)=COALESCE(?,-1) AND seq=?",
             (tid, kind, item_id, seq)).fetchall()
         was_locked = any(r["locked"] for r in existing)
-        if was_locked and locked == 1 and data.get("_changing", True):
-            # 已锁：只允许显式解锁请求改写
-            if not data.get("unlock"):
-                return jsonify({"ok": False,
-                                "error": "该动作分工已锁（连排确认）：请先解锁"}), 409
+        old_ids = sorted(r["dresser_id"] for r in existing)
+        old_lead = next((r["dresser_id"] for r in existing if r["is_lead"]), None)
+        content_changed = (old_ids != sorted(ids)) or (old_lead != lead)
+        # 已锁分工：只有显式解锁请求可改；纯重复上锁（内容不变）允许
+        if was_locked and content_changed and not data.get("unlock"):
+            return jsonify({"ok": False,
+                            "error": "该动作分工已锁（连排确认）：请先解锁"}), 409
         valid = {r["id"] for r in con.execute(
             "SELECT id FROM dressers WHERE production_id=?", (PID,)).fetchall()}
         if any(x not in valid for x in ids):
@@ -248,34 +254,83 @@ def api_action_staff(tid):
     return jsonify(full_state())
 
 
+def _mark_action_review(con, task_ids, reason):
+    """把给定任务的所有已登记动作分工标记为待复核。"""
+    if not task_ids:
+        return
+    rows = con.execute(
+        f"SELECT DISTINCT task_id,kind,item_id,seq FROM action_staff "
+        f"WHERE task_id IN ({','.join('?' * len(task_ids))})", tuple(task_ids))
+    for r in rows:
+        exists = con.execute(
+            "SELECT 1 FROM action_reviews WHERE production_id=? AND task_id=? AND kind=? "
+            "AND COALESCE(item_id,-1)=COALESCE(?,-1) AND seq=?",
+            (PID, r["task_id"], r["kind"], r["item_id"], r["seq"])).fetchone()
+        if not exists:
+            con.execute(
+                "INSERT INTO action_reviews(production_id,task_id,kind,item_id,seq,"
+                "reason,created_at) VALUES(?,?,?,?,?,?,?)",
+                (PID, r["task_id"], r["kind"], r["item_id"], r["seq"], reason, time.time()))
+
+
 @app.post("/api/dressers/<int:did>/profile")
 def api_dresser_profile(did):
     """服装师资料：技能（skill_ids）、可支援侧台（sides）。
-    资料变化只标记引用该服装师的动作所属任务待复核。"""
+    资料变化只标记该服装师实际参与的具体动作待复核（不整任务标红）。"""
     data = request.get_json(force=True)
     con = db.connect()
     try:
         if not con.execute("SELECT 1 FROM dressers WHERE id=? AND production_id=?",
                            (did, PID)).fetchone():
             return jsonify({"ok": False, "error": "服装师不存在"}), 404
+        old_skills = {r["skill_id"] for r in con.execute(
+            "SELECT skill_id FROM dresser_skills WHERE dresser_id=?", (did,))}
+        old_sides = {r["side"] for r in con.execute(
+            "SELECT side FROM dresser_sides WHERE dresser_id=?", (did,))}
         if "skill_ids" in data:
             con.execute("DELETE FROM dresser_skills WHERE dresser_id=?", (did,))
             for sid in set(int(x) for x in data["skill_ids"]):
                 con.execute("INSERT OR IGNORE INTO dresser_skills(dresser_id,skill_id) "
                             "VALUES(?,?)", (did, sid))
         if "sides" in data:
-            sides = set(data["sides"]) & {"L", "R"}
+            new_sides = set(data["sides"]) & {"L", "R"}
             con.execute("DELETE FROM dresser_sides WHERE dresser_id=?", (did,))
-            for sd in sides:
+            for sd in new_sides:
                 con.execute("INSERT OR IGNORE INTO dresser_sides(dresser_id,side) "
                             "VALUES(?,?)", (did, sd))
-        # 资料变化 → 仅相关动作（引用该服装师的分工）待复核
-        con.execute("""
-            UPDATE tasks SET needs_review=1 WHERE id IN (
-                SELECT DISTINCT task_id FROM action_staff WHERE dresser_id=?)
-            OR id IN (
-                SELECT DISTINCT t.id FROM tasks t WHERE t.dresser_id=?)""",
-                    (did, did))
+        else:
+            new_sides = old_sides
+        new_skills = {r["skill_id"] for r in con.execute(
+            "SELECT skill_id FROM dresser_skills WHERE dresser_id=?", (did,))}
+        skill_changed = ("skill_ids" in data and new_skills != old_skills)
+        side_changed = ("sides" in data and new_sides != old_sides)
+        # 仅标记该服装师实际参与的具体动作（不整任务标红）
+        if skill_changed or side_changed:
+            tids = [r["task_id"] for r in con.execute(
+                "SELECT DISTINCT task_id FROM action_staff WHERE dresser_id=?",
+                (did,)).fetchall()]
+            _mark_action_review(con, tids,
+                                "服装师技能变更" if skill_changed else "可支援侧台变更")
+        con.commit()
+    finally:
+        con.close()
+    return jsonify(full_state())
+
+
+@app.post("/api/tasks/<int:tid>/clear_review")
+def api_clear_action_review(tid):
+    """清除某动作的待复核标记（缺省 kind/item_id/seq 时清整任务）。"""
+    data = request.get_json(silent=True) or {}
+    con = db.connect()
+    try:
+        if "kind" in data:
+            con.execute(
+                "DELETE FROM action_reviews WHERE task_id=? AND kind=? "
+                "AND COALESCE(item_id,-1)=COALESCE(?,-1) AND seq=?",
+                (tid, data["kind"], data.get("item_id"), int(data.get("seq", 0))))
+        else:
+            con.execute("DELETE FROM action_reviews WHERE task_id=?", (tid,))
+            con.execute("UPDATE tasks SET needs_review=0 WHERE id=?", (tid,))
         con.commit()
     finally:
         con.close()
@@ -313,11 +368,16 @@ def api_update(entity, rid):
     try:
         con.execute(f"UPDATE {entity} SET {','.join(c+'=?' for c in cols)} WHERE id=?",
                     [data[c] for c in cols] + [rid])
-        # 场次时间或道具/服装状态变化 → 仅关联任务置为待复核
+        # 场次时间或道具/服装状态变化 → 关联任务整体标复核，
+        # 已登记动作级分工的具体动作也逐条标记
         if entity == "scenes" and {"start_sec", "duration_sec"} & set(data):
             con.execute(
                 "UPDATE tasks SET needs_review=1 WHERE from_scene_id=? OR to_scene_id=?",
                 (rid, rid))
+            tids = [r["id"] for r in con.execute(
+                "SELECT id FROM tasks WHERE from_scene_id=? OR to_scene_id=?",
+                (rid, rid)).fetchall()]
+            _mark_action_review(con, tids, "场次时间变更")
         if entity == "items" and {"status", "available_at", "cart_id", "skill_id"} & set(data):
             con.execute("""
               UPDATE tasks SET needs_review=1 WHERE id IN (
@@ -329,6 +389,16 @@ def api_update(entity, rid):
                 JOIN looks l2 ON l2.actor_id=t.actor_id AND l2.scene_id=t.to_scene_id
                 JOIN look_items li2 ON li2.look_id=l2.id AND li2.item_id=?)
             """, (rid, rid))
+            tids = [r["id"] for r in con.execute("""
+                SELECT DISTINCT t.id FROM tasks t
+                JOIN looks l1 ON l1.actor_id=t.actor_id AND l1.scene_id=t.from_scene_id
+                JOIN look_items li1 ON li1.look_id=l1.id AND li1.item_id=?
+                UNION
+                SELECT t.id FROM tasks t
+                JOIN looks l2 ON l2.actor_id=t.actor_id AND l2.scene_id=t.to_scene_id
+                JOIN look_items li2 ON li2.look_id=l2.id AND li2.item_id=?
+            """, (rid, rid)).fetchall()]
+            _mark_action_review(con, tids, "服装/道具变更")
         con.commit()
     finally:
         con.close()
