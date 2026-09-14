@@ -48,7 +48,11 @@ CREATE TABLE IF NOT EXISTS items(
   cart_id INTEGER,
   copies INTEGER NOT NULL DEFAULT 1,
   skill_id INTEGER,              -- 该服装穿/脱动作的默认所需技能
-  closure TEXT NOT NULL DEFAULT 'zip'  -- 默认闭合件：zip拉链|hook钩扣|tie系带|frog盘扣
+  closure TEXT NOT NULL DEFAULT 'zip', -- 默认闭合件：zip拉链|hook钩扣|tie系带|frog盘扣
+  -- 场间复位：该类服装副本日场穿用后默认需要的养护工序（道具默认全 0）
+  need_clean INTEGER NOT NULL DEFAULT 1,  -- 去渍/清洁
+  need_dry INTEGER NOT NULL DEFAULT 1,    -- 烘干
+  need_press INTEGER NOT NULL DEFAULT 1   -- 整烫
 );
 CREATE TABLE IF NOT EXISTS look_items(
   look_id INTEGER NOT NULL,
@@ -240,6 +244,77 @@ CREATE TABLE IF NOT EXISTS understudy_branches(
   created_at REAL NOT NULL,
   confirmed_at REAL
 );
+
+-- ---------------- 场间复位工作区 ----------------
+-- 养护设备（清洁机/烘干机）与工位（缝补台/整烫台/装车口）：
+-- 均为「区间日历」资源：capacity 并发容量，cool_down_sec 占用结束后
+-- （冷却间隔，含烘干部件冷却）设备/工位不可再排的间隔秒数。
+CREATE TABLE IF NOT EXISTS care_resources(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  kind TEXT NOT NULL,        -- clean | dry | mend | press | load
+  is_station INTEGER NOT NULL DEFAULT 0,  -- 0=设备（清洁/烘干），1=工位
+  capacity INTEGER NOT NULL DEFAULT 1,
+  cool_down_sec INTEGER NOT NULL DEFAULT 0,
+  skill_id INTEGER
+);
+-- 复位工作区：从选定连排的实际穿用记录或已确认方案（修订）生成；
+-- evening_offset_sec 把当晚场次时间轴平移到日场时钟（日场结束=养护窗口起点）。
+CREATE TABLE IF NOT EXISTS turnarounds(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'open',    -- open | archived
+  source_kind TEXT NOT NULL,              -- run | revision
+  source_id INTEGER NOT NULL,             -- runs.id 或 revisions.id
+  evening_offset_sec INTEGER NOT NULL DEFAULT 0,
+  source_json TEXT NOT NULL DEFAULT '{}', -- 生成时来源摘要（归档随附）
+  archived_json TEXT,                     -- 归档包：来源记录+人工计划+执行事件
+  created_at REAL NOT NULL,
+  archived_at REAL
+);
+-- 逐副本养护路线：一件实际穿用副本一行；deadline_sec=晚场造型就位期限
+CREATE TABLE IF NOT EXISTS care_routes(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL,
+  turnaround_id INTEGER NOT NULL,
+  item_id INTEGER NOT NULL,
+  copy_no INTEGER NOT NULL,              -- 1 起，对应 item_copies.copy_no
+  item_name TEXT NOT NULL DEFAULT '',
+  released_at INTEGER NOT NULL DEFAULT 0,  -- 日场脱下可收回养护的时刻
+  deadline_sec INTEGER,                   -- 晚场就位期限（NULL=晚场不再引用）
+  ref_task_ids TEXT NOT NULL DEFAULT '[]', -- 晚场引用该副本的换装任务 id
+  sort_key INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(turnaround_id, item_id, copy_no)
+);
+-- 路线上的有序工序：clean→dry→mend→press→load（按 kind 固定次序）
+CREATE TABLE IF NOT EXISTS care_steps(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL,
+  turnaround_id INTEGER NOT NULL,
+  route_id INTEGER NOT NULL,
+  seq INTEGER NOT NULL,                  -- 路线内序号，0 起
+  kind TEXT NOT NULL,                    -- clean | dry | mend | press | load
+  dur_sec INTEGER NOT NULL,
+  resource_id INTEGER,                   -- 指派设备/工位（NULL=待排）
+  dresser_id INTEGER,                    -- 指派人员（NULL=待排）
+  start_sec INTEGER,                     -- 人工钉死的开始时刻（NULL=自动）
+  locked INTEGER NOT NULL DEFAULT 0,     -- 完工锁定后不再挪动
+  note TEXT NOT NULL DEFAULT ''
+);
+-- 执行事件：start 开工 / done 完工 / return 退回重做 / scrap 报废；
+-- 只追加，退回与报废由计算层解释，不改写已发生事件。
+CREATE TABLE IF NOT EXISTS care_events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL,
+  turnaround_id INTEGER NOT NULL,
+  step_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,                    -- start | done | return | scrap
+  at_sec INTEGER NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  created_at REAL NOT NULL
+);
 """
 
 
@@ -258,6 +333,12 @@ def _migrate(con):
         con.execute("ALTER TABLE items ADD COLUMN skill_id INTEGER")
     if icols and "closure" not in icols:
         con.execute("ALTER TABLE items ADD COLUMN closure TEXT NOT NULL DEFAULT 'zip'")
+    # 场间复位：旧库补齐工序需求列；道具默认无需养护
+    for col, dflt in (("need_clean", 1), ("need_dry", 1), ("need_press", 1)):
+        if icols and col not in icols:
+            con.execute(f"ALTER TABLE items ADD COLUMN {col} INTEGER NOT NULL DEFAULT {dflt}")
+            con.execute(
+                f"UPDATE items SET {col}=0 WHERE kind='prop'")
     con.commit()
 
 
@@ -322,6 +403,13 @@ def load_state(production_id=1):
                 "SELECT cf.* FROM copy_fit cf JOIN item_copies ic ON ic.id=cf.copy_id "
                 "WHERE ic.production_id=? ORDER BY cf.copy_id,cf.dim", (pid,)),
             "revisions": rows(con, "SELECT id,production_id,created_at,note FROM revisions WHERE production_id=? ORDER BY id DESC", (pid,)),
+            "care_resources": rows(con,
+                "SELECT * FROM care_resources WHERE production_id=? ORDER BY is_station,kind,id",
+                (pid,)),
+            "turnarounds": rows(con,
+                "SELECT id,production_id,name,status,source_kind,source_id,evening_offset_sec,"
+                "created_at,archived_at FROM turnarounds WHERE production_id=? ORDER BY id DESC",
+                (pid,)),
         }
         look_ids = {l["id"] for l in state["looks"]}
         state["look_items"] = [li for li in state["look_items"] if li["look_id"] in look_ids]
@@ -679,6 +767,167 @@ def mark_understudy_dirty(pid, actor_ids=None, item_ids=None):
                     hit = True
             if hit:
                 con.execute("UPDATE understudy_branches SET needs_review=1 WHERE id=?", (b["id"],))
+        con.commit()
+    finally:
+        con.close()
+
+
+# ---------------- 场间复位工作区 ----------------
+
+def get_turnaround(tid):
+    con = connect()
+    try:
+        return row(con, "SELECT * FROM turnarounds WHERE id=?", (tid,))
+    finally:
+        con.close()
+
+
+def care_routes(tid):
+    con = connect()
+    try:
+        return rows(con,
+            "SELECT * FROM care_routes WHERE turnaround_id=? ORDER BY sort_key,id", (tid,))
+    finally:
+        con.close()
+
+
+def care_steps(tid):
+    con = connect()
+    try:
+        return rows(con,
+            "SELECT * FROM care_steps WHERE turnaround_id=? ORDER BY route_id,seq,id", (tid,))
+    finally:
+        con.close()
+
+
+def care_events(tid):
+    con = connect()
+    try:
+        return rows(con,
+            "SELECT * FROM care_events WHERE turnaround_id=? ORDER BY id", (tid,))
+    finally:
+        con.close()
+
+
+def care_resources(pid=1):
+    con = connect()
+    try:
+        return rows(con,
+            "SELECT * FROM care_resources WHERE production_id=? ORDER BY is_station,kind,id",
+            (pid,))
+    finally:
+        con.close()
+
+
+def create_turnaround(name, source_kind, source_id, evening_offset, routes_spec,
+                      source_summary, pid=1):
+    """一次性生成工作区、逐副本路线与默认工序。
+    routes_spec: [{item_id, copy_no, item_name, released_at, deadline_sec,
+                   ref_task_ids:[...], kinds:[...], sort_key}]
+    """
+    con = connect()
+    try:
+        cur = con.execute(
+            "INSERT INTO turnarounds(production_id,name,status,source_kind,source_id,"
+            "evening_offset_sec,source_json,created_at) VALUES(?,?,'open',?,?,?,?,?)",
+            (pid, name, source_kind, int(source_id), int(evening_offset or 0),
+             json.dumps(source_summary, ensure_ascii=False), time.time()))
+        tid = cur.lastrowid
+        for r in routes_spec:
+            rc = con.execute(
+                "INSERT INTO care_routes(production_id,turnaround_id,item_id,copy_no,"
+                "item_name,released_at,deadline_sec,ref_task_ids,sort_key) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (pid, tid, r["item_id"], r["copy_no"], r["item_name"],
+                 int(r["released_at"]),
+                 None if r.get("deadline_sec") is None else int(r["deadline_sec"]),
+                 json.dumps(r.get("ref_task_ids", []), ensure_ascii=False),
+                 int(r.get("sort_key", 0))))
+            rid = rc.lastrowid
+            for seq, (kind, dur) in enumerate(r["kinds"]):
+                con.execute(
+                    "INSERT INTO care_steps(production_id,turnaround_id,route_id,seq,kind,"
+                    "dur_sec,locked) VALUES(?,?,?,?,?,?,0)",
+                    (pid, tid, rid, seq, kind, int(dur)))
+        con.commit()
+        return tid
+    finally:
+        con.close()
+
+
+def get_care_step(step_id):
+    con = connect()
+    try:
+        return row(con, "SELECT * FROM care_steps WHERE id=?", (step_id,))
+    finally:
+        con.close()
+
+
+def update_care_step(step_id, sets):
+    if not sets:
+        return
+    con = connect()
+    try:
+        con.execute(
+            f"UPDATE care_steps SET {','.join(k+'=?' for k in sets)} WHERE id=?",
+            list(sets.values()) + [step_id])
+        con.commit()
+    finally:
+        con.close()
+
+
+def add_care_event(tid, step_id, kind, at_sec, reason, pid=1):
+    con = connect()
+    try:
+        cur = con.execute(
+            "INSERT INTO care_events(production_id,turnaround_id,step_id,kind,at_sec,"
+            "reason,created_at) VALUES(?,?,?,?,?,?,?)",
+            (pid, tid, step_id, kind, int(at_sec), reason, time.time()))
+        con.commit()
+        return cur.lastrowid
+    finally:
+        con.close()
+
+
+def archive_turnaround(tid, archive_pack):
+    con = connect()
+    try:
+        con.execute(
+            "UPDATE turnarounds SET status='archived', archived_json=?, archived_at=? "
+            "WHERE id=?",
+            (json.dumps(archive_pack, ensure_ascii=False), time.time(), tid))
+        con.commit()
+    finally:
+        con.close()
+
+
+def upsert_care_resource(pid, name, kind, is_station, capacity, cool_down_sec,
+                         skill_id=None, rid=None):
+    con = connect()
+    try:
+        if rid:
+            con.execute(
+                "UPDATE care_resources SET name=?,kind=?,is_station=?,capacity=?,"
+                "cool_down_sec=?,skill_id=? WHERE id=? AND production_id=?",
+                (name, kind, int(is_station), int(capacity), int(cool_down_sec),
+                 skill_id, rid, pid))
+            return rid
+        cur = con.execute(
+            "INSERT INTO care_resources(production_id,name,kind,is_station,capacity,"
+            "cool_down_sec,skill_id) VALUES(?,?,?,?,?,?,?)",
+            (pid, name, kind, int(is_station), int(capacity), int(cool_down_sec), skill_id))
+        con.commit()
+        return cur.lastrowid
+    finally:
+        con.close()
+
+
+def delete_care_resource(pid, rid):
+    con = connect()
+    try:
+        con.execute("UPDATE care_steps SET resource_id=NULL "
+                    "WHERE resource_id=? AND production_id=?", (rid, pid))
+        con.execute("DELETE FROM care_resources WHERE id=? AND production_id=?", (rid, pid))
         con.commit()
     finally:
         con.close()

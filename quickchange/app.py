@@ -13,6 +13,7 @@ from flask import Flask, Response, jsonify, render_template, request
 import db
 import rehearsal
 import scheduler
+import turnaround
 import understudy
 
 app = Flask(__name__)
@@ -42,7 +43,15 @@ def full_state():
     state["schedule"] = sched
     state["runs"] = db.list_runs(PID)
     state["understudy_branches"] = db.list_branches(PID)
+    if SELECTED_TURNAROUND["id"]:
+        tr = db.get_turnaround(SELECTED_TURNAROUND["id"])
+        state["turnaround_detail"] = turnaround.detail(state, tr) if tr else None
+    else:
+        state["turnaround_detail"] = None
     return state
+
+
+SELECTED_TURNAROUND = {"id": None}
 
 
 @app.get("/")
@@ -1204,6 +1213,314 @@ def export_understudy_diff(bid):
     state = db.load_state(PID)
     return _understudy_diff_svg(br, plan, state,
                                 dl=bool(request.args.get("dl")))
+
+
+# ---------------- 场间复位工作区 ----------------
+
+def _tr_detail_or_404(tid):
+    tr = db.get_turnaround(tid)
+    if not tr or tr["production_id"] != PID:
+        return None, (jsonify({"ok": False, "error": "复位工作区不存在"}), 404)
+    return tr, None
+
+
+@app.post("/api/turnarounds")
+def api_turnaround_create():
+    """从选定连排的实际穿用记录或已确认方案（修订）生成逐副本养护路线。"""
+    data = request.get_json(force=True)
+    source_kind = data.get("source_kind")
+    if source_kind not in ("run", "revision"):
+        return jsonify({"ok": False, "error": "来源必须是 run（连排）或 revision（修订）"}), 400
+    try:
+        source_id = int(data.get("source_id"))
+        offset = max(0, int(data.get("evening_offset_sec") or 0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "来源/晚场偏移参数无效"}), 400
+    if source_kind == "run":
+        run = db.get_run(source_id)
+        if not run or run["production_id"] != PID:
+            return jsonify({"ok": False, "error": "连排不存在"}), 404
+        src_name = run["name"]
+    else:
+        rev = db.get_revision(source_id)
+        if not rev or rev["production_id"] != PID:
+            return jsonify({"ok": False, "error": "修订不存在"}), 404
+        src_name = f"修订#{rev['id']}"
+    state = db.load_state(PID)
+    spec, summary = turnaround.build_routes_spec(
+        state, source_kind, source_id, offset, PID)
+    if spec is None:
+        return jsonify({"ok": False, "error": "来源不存在"}), 404
+    if not spec:
+        return jsonify({"ok": False,
+                        "error": "来源中没有可生成养护路线的实际穿用副本"}), 400
+    name = (data.get("name") or f"场间复位·{src_name}").strip()
+    tid = db.create_turnaround(name, source_kind, source_id, offset, spec, summary, PID)
+    SELECTED_TURNAROUND["id"] = tid
+    return jsonify({"ok": True, "id": tid, "detail": _turnaround_detail(tid)})
+
+
+def _turnaround_detail(tid):
+    return turnaround.detail(db.load_state(PID), db.get_turnaround(tid))
+
+
+@app.get("/api/turnarounds/<int:tid>")
+def api_turnaround_get(tid):
+    tr, err = _tr_detail_or_404(tid)
+    if err:
+        return err
+    SELECTED_TURNAROUND["id"] = tid
+    return jsonify({"ok": True, "detail": turnaround.detail(db.load_state(PID), tr)})
+
+
+@app.post("/api/turnarounds/select")
+def api_turnaround_select():
+    tid = int((request.get_json(force=True) or {}).get("id") or 0)
+    if tid:
+        tr, err = _tr_detail_or_404(tid)
+        if err:
+            return err
+    SELECTED_TURNAROUND["id"] = tid or None
+    return jsonify(full_state())
+
+
+@app.post("/api/care_steps/<int:sid>")
+def api_care_step_update(sid):
+    """拖排/改派工序：设备工位、人员、人工时刻、用时、备注。
+    完工锁定工序的时间/资源不得改动；改派只钉住本工序，后续自动重算。"""
+    s = db.get_care_step(sid)
+    if not s or s["production_id"] != PID:
+        return jsonify({"ok": False, "error": "工序不存在"}), 404
+    tr = db.get_turnaround(s["turnaround_id"])
+    if tr["status"] == "archived":
+        return jsonify({"ok": False, "error": "工作区已归档，不能修改"}), 409
+    data = request.get_json(force=True)
+    sets = {}
+    for k in ("resource_id", "dresser_id", "start_sec", "dur_sec", "note"):
+        if k in data:
+            sets[k] = data[k]
+    if "dur_sec" in sets:
+        try:
+            sets["dur_sec"] = max(1, int(sets["dur_sec"]))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "用时必须是正整数秒"}), 400
+    # 已锁（完工）工序：时刻与资源不可动，只允许改备注
+    eff = turnaround.effective_care_events(db.care_events(tr["id"]))
+    done = eff.get(sid, {}).get("done") or s["locked"]
+    locked_fields = ("resource_id", "dresser_id", "start_sec", "dur_sec")
+    if done and any(k in sets for k in locked_fields):
+        return jsonify({"ok": False,
+                        "error": "完工工序已锁定，不能再挪动或改派"}), 409
+    # 资源类型必须与工序匹配；人员须为该剧目服装师
+    con = db.connect()
+    try:
+        rid = sets.get("resource_id", s["resource_id"])
+        if rid:
+            row = con.execute("SELECT kind FROM care_resources WHERE id=? AND production_id=?",
+                              (rid, PID)).fetchone()
+            if not row:
+                return jsonify({"ok": False, "error": "设备/工位不存在"}), 404
+            if row["kind"] != s["kind"]:
+                return jsonify({"ok": False,
+                                "error": f"该工序只能指派{turnaround.STEP_CN[s['kind']]}类资源"}), 400
+        did = sets.get("dresser_id", s["dresser_id"])
+        if did and not con.execute("SELECT 1 FROM dressers WHERE id=? AND production_id=?",
+                                   (did, PID)).fetchone():
+            return jsonify({"ok": False, "error": "服装师不存在"}), 400
+    finally:
+        con.close()
+    db.update_care_step(sid, sets)
+    return jsonify({"ok": True, "detail": _turnaround_detail(tr["id"])})
+
+
+@app.post("/api/care_steps/<int:sid>/events")
+def api_care_step_event(sid):
+    """追加执行事件：start 开工 / done 完工（锁定）/ return 退回重做 / scrap 报废。
+    报废使整条路线后续工序取消；return 必须留理由。"""
+    s = db.get_care_step(sid)
+    if not s or s["production_id"] != PID:
+        return jsonify({"ok": False, "error": "工序不存在"}), 404
+    tr = db.get_turnaround(s["turnaround_id"])
+    if tr["status"] == "archived":
+        return jsonify({"ok": False, "error": "工作区已归档，不能再登记事件"}), 409
+    data = request.get_json(force=True)
+    kind = data.get("kind")
+    if kind not in turnaround.EVENT_KINDS:
+        return jsonify({"ok": False, "error": "事件类型必须是 start/done/return/scrap"}), 400
+    try:
+        at_sec = int(data.get("at_sec"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "时刻必须是整数秒"}), 400
+    reason = (data.get("reason") or "").strip()
+    if kind in ("return", "scrap") and not reason:
+        return jsonify({"ok": False,
+                        "error": "退回重做/报废必须填写理由（随档保留）"}), 400
+    eff = turnaround.effective_care_events(db.care_events(tr["id"]))
+    evs = eff.get(sid, {})
+    if evs.get("scrap"):
+        return jsonify({"ok": False, "error": "该副本已报废，工序不再接受事件"}), 409
+    if kind == "done":
+        st = evs.get("start")
+        if st and at_sec < st["at_sec"]:
+            return jsonify({"ok": False,
+                            "error": f"完工时刻 {scheduler.fmt(at_sec)} 早于开工 "
+                                     f"{scheduler.fmt(st['at_sec'])}"}), 400
+    db.add_care_event(tr["id"], sid, kind, at_sec, reason, PID)
+    sets = {}
+    if kind == "done":
+        # 完工锁定：钉在实测时段（有开工打点取开工，否则按完工-用时倒推），
+        # 之后重排不再挪动
+        sets["locked"] = 1
+        st = eff.get("start")
+        if s["start_sec"] is None:
+            sets["start_sec"] = st["at_sec"] if st else max(0, at_sec - s["dur_sec"])
+    elif kind == "start" and s["start_sec"] is None:
+        sets["start_sec"] = at_sec
+    elif kind == "return":
+        # 退回重做：该工序回到待排（解锁、清人工时刻），后序随重算
+        sets["locked"] = 0
+        sets["start_sec"] = None
+    elif kind == "scrap":
+        sets["locked"] = 0
+    if sets:
+        db.update_care_step(sid, sets)
+    return jsonify({"ok": True, "detail": _turnaround_detail(tr["id"])})
+
+
+@app.post("/api/turnarounds/<int:tid>/archive")
+def api_turnaround_archive(tid):
+    """归档：随档保存来源记录、人工计划与执行事件。归档后只读。"""
+    tr, err = _tr_detail_or_404(tid)
+    if err:
+        return err
+    if tr["status"] == "archived":
+        return jsonify({"ok": False, "error": "工作区已归档"}), 409
+    state = db.load_state(PID)
+    db.archive_turnaround(tid, turnaround.archive_pack(state, tr))
+    return jsonify({"ok": True, "detail": _turnaround_detail(tid)})
+
+
+@app.get("/export/turnarounds/<int:tid>/record")
+def export_turnaround_record(tid):
+    """场间复位记录（HTML，可打印）：来源、逐副本路线、执行事件与卡点。"""
+    tr, err = _tr_detail_or_404(tid)
+    if err:
+        return "复位工作区不存在", 404
+    d = turnaround.detail(db.load_state(PID), tr)
+    resources = {r["id"]: r for r in db.care_resources(PID)}
+    dressers = {x["id"]: x for x in db.load_state(PID)["dressers"]}
+    routes = {r["id"]: r for r in d["routes"]}
+    steps_by_route = {}
+    for s in d["steps"]:
+        steps_by_route.setdefault(s["route_id"], []).append(s)
+    ev_by_step = {}
+    for e in d["events"]:
+        ev_by_step.setdefault(e["step_id"], []).append(e)
+
+    def rname(rid):
+        return resources.get(rid, {}).get("name", "—") if rid else "—"
+
+    def dname(did):
+        return dressers.get(did, {}).get("name", "—") if did else "—"
+
+    rows = []
+    for r in sorted(d["routes"], key=lambda x: (x["sort_key"], x["id"])):
+        dl = "晚场不再引用" if r["deadline_sec"] is None else scheduler.fmt(r["deadline_sec"])
+        rows.append(
+            f"<tr class=route><td colspan=8><b>#{r['id']} {_xml(r['item_name'])}"
+            f"第{r['copy_no']}件</b>｜收回 {scheduler.fmt(r['released_at'])}｜"
+            f"就位期限 {dl}｜状态 {_xml(r['status'])}"
+            + (f"｜<b class='{'ok' if r['on_time'] else 'bad'}'>"
+               f"{'按时就位 ✓' if r['on_time'] else '无法按时归位 ✗'}</b>"
+               if r["on_time"] is not None else "") + "</td></tr>")
+        for s in sorted(steps_by_route.get(r["id"], []), key=lambda x: x["seq"]):
+            win = (f"{scheduler.fmt(s['start'])}–{scheduler.fmt(s['end'])}"
+                   if s.get("start") is not None else "未排")
+            ev_txt = "；".join(
+                f"{ {'start':'开工','done':'完工','return':'退回重做','scrap':'报废'}[e['kind']]}"
+                f"@{scheduler.fmt(e['at_sec'])}"
+                + (f"：{_xml(e['reason'])}" if e["reason"] else "")
+                for e in ev_by_step.get(s["id"], [])) or "—"
+            rows.append(
+                f"<tr><td></td><td>{s['seq']} {s['label']}{'🔒' if s['locked'] else ''}</td>"
+                f"<td>{s['dur_sec']}s</td><td>{rname(s.get('res_resource_id'))}</td>"
+                f"<td>{dname(s.get('res_dresser_id'))}</td><td>{win}</td>"
+                f"<td>{_xml(s.get('note') or '')}</td><td class=note>{ev_txt}</td></tr>")
+    src = d["source"]
+    if src.get("kind") == "run":
+        src_txt = f"连排#{src.get('run_id')} {_xml(src.get('run_name',''))}" \
+                  f"（基准修订#{src.get('revision_id')}）实际穿用记录"
+    else:
+        src_txt = f"已确认方案：修订#{src.get('revision_id')} {_xml(src.get('note',''))}"
+    conf = "".join(
+        f"<li>[{scheduler.fmt(c['time'])}] {_xml(c['message'])}</li>"
+        for c in d["conflicts"]) or "<li>无 ✓</li>"
+    html = f"""<!doctype html><html lang=zh><meta charset=utf-8>
+<title>场间复位记录 · {_xml(tr['name'])}</title>
+<style>body{{font-family:sans-serif;margin:24px}}table{{border-collapse:collapse;width:100%;margin:8px 0}}
+td,th{{border:1px solid #999;padding:5px 7px;font-size:12px;vertical-align:top}}
+tr.route td{{background:#eef3fa}}h1{{font-size:19px}}h2{{font-size:15px;margin-top:18px}}
+.note{{color:#a04000}}.bad{{color:#c0392b}}.ok{{color:#27ae60}}</style>
+<h1>场间复位记录 · {_xml(tr['name'])}</h1>
+<p>来源：{src_txt}｜晚场偏移 {tr['evening_offset_sec']}s｜状态：
+{'已归档（只读）' if tr['status'] == 'archived' else '进行中'}</p>
+<h2>逐副本养护路线（人工计划 + 执行事件）</h2>
+<table><tr><th></th><th>工序</th><th>用时</th><th>设备/工位</th><th>人员</th>
+<th>计划时段</th><th>备注</th><th>执行事件</th></tr>{''.join(rows)}</table>
+<h2>卡点与提醒</h2><ul>{conf}</ul></html>"""
+    return html
+
+
+# ---------------- 养护资源（设备/工位） ----------------
+
+CARE_RESOURCE_KINDS = {"clean", "dry", "mend", "press", "load"}
+
+
+@app.post("/api/care_resources")
+def api_care_resource_create():
+    data = request.get_json(force=True)
+    kind = data.get("kind")
+    if kind not in CARE_RESOURCE_KINDS:
+        return jsonify({"ok": False, "error": "类型必须是 clean/dry/mend/press/load"}), 400
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "名称必填"}), 400
+    is_station = 1 if kind in turnaround.STATION_KINDS else 0
+    rid = db.upsert_care_resource(
+        PID, name, kind, is_station,
+        max(1, int(data.get("capacity") or 1)),
+        max(0, int(data.get("cool_down_sec") or 0)),
+        data.get("skill_id") or None)
+    return jsonify({"ok": True, "id": rid})
+
+
+@app.post("/api/care_resources/<int:rid>")
+def api_care_resource_update(rid):
+    data = request.get_json(force=True)
+    con = db.connect()
+    try:
+        row = con.execute("SELECT * FROM care_resources WHERE id=? AND production_id=?",
+                          (rid, PID)).fetchone()
+        if not row:
+            return jsonify({"ok": False, "error": "资源不存在"}), 404
+        kind = data.get("kind") or row["kind"]
+        if kind not in CARE_RESOURCE_KINDS:
+            return jsonify({"ok": False, "error": "类型无效"}), 400
+        db.upsert_care_resource(
+            PID, (data.get("name") or row["name"]).strip(), kind,
+            1 if kind in turnaround.STATION_KINDS else 0,
+            max(1, int(data.get("capacity", row["capacity"]))),
+            max(0, int(data.get("cool_down_sec", row["cool_down_sec"]))),
+            data.get("skill_id", row["skill_id"]) or None, rid=rid)
+    finally:
+        con.close()
+    return jsonify(full_state())
+
+
+@app.delete("/api/care_resources/<int:rid>")
+def api_care_resource_delete(rid):
+    db.delete_care_resource(PID, rid)
+    return jsonify(full_state())
 
 
 # ---------------- 导出 ----------------
