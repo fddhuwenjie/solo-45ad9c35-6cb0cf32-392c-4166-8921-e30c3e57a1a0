@@ -315,6 +315,84 @@ CREATE TABLE IF NOT EXISTS care_events(
   reason TEXT NOT NULL DEFAULT '',
   created_at REAL NOT NULL
 );
+
+-- ---------------- 侧台通行推演（路网） ----------------
+-- 通道节点：corridor=普通节点；door=门洞（容量1，通过需 dwell_sec，窄门排队）
+CREATE TABLE IF NOT EXISTS net_nodes(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL,
+  x REAL NOT NULL,
+  y REAL NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL DEFAULT 'corridor',   -- corridor | door
+  dwell_sec INTEGER NOT NULL DEFAULT 0
+);
+-- 路段：净宽/通行耗时/容量/单向；traverse_sec=0 时按长度÷速度估算；
+-- capacity=0 时按净宽推导（每 0.6m 容 1 人）
+CREATE TABLE IF NOT EXISTS net_edges(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL,
+  a_node INTEGER NOT NULL,
+  b_node INTEGER NOT NULL,
+  width_m REAL NOT NULL DEFAULT 1.5,
+  traverse_sec INTEGER NOT NULL DEFAULT 0,
+  capacity INTEGER NOT NULL DEFAULT 0,
+  oneway INTEGER NOT NULL DEFAULT 0        -- 0=双向，1=仅 a→b
+);
+-- 路段封闭时段：随场次（scene_id 的演出时段）或显式起止
+CREATE TABLE IF NOT EXISTS net_closures(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL,
+  edge_id INTEGER NOT NULL,
+  scene_id INTEGER,
+  start_sec INTEGER,
+  end_sec INTEGER,
+  reason TEXT NOT NULL DEFAULT ''
+);
+-- 禁行区：多边形，落区内的节点与路段不可通行
+CREATE TABLE IF NOT EXISTS net_zones(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  points_json TEXT NOT NULL DEFAULT '[]'
+);
+-- 上场口吸附：侧 → 路网节点
+CREATE TABLE IF NOT EXISTS net_exits(
+  production_id INTEGER NOT NULL,
+  side TEXT NOT NULL,                      -- L | R
+  node_id INTEGER NOT NULL,
+  PRIMARY KEY(production_id, side)
+);
+-- 人工计划：拖改路径（某任务某移动体的指定节点序列）
+CREATE TABLE IF NOT EXISTS net_paths(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL,
+  task_id INTEGER NOT NULL,
+  mover_kind TEXT NOT NULL,                -- actor | dresser | cart
+  mover_id INTEGER NOT NULL,
+  nodes_json TEXT NOT NULL DEFAULT '[]',
+  created_at REAL NOT NULL
+);
+-- 让行顺序：指定移动体在该路段优先通行
+CREATE TABLE IF NOT EXISTS net_yields(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  production_id INTEGER NOT NULL,
+  edge_id INTEGER NOT NULL,
+  mover_kind TEXT NOT NULL,
+  mover_id INTEGER NOT NULL
+);
+-- 路网版本：任何路网变更递增，随修订快照留存
+CREATE TABLE IF NOT EXISTS net_meta(
+  production_id INTEGER PRIMARY KEY,
+  version INTEGER NOT NULL DEFAULT 1
+);
+-- 最近一次通行推演（逐段时刻）：增量重算定位受影响任务，修订快照留存
+CREATE TABLE IF NOT EXISTS net_sim(
+  production_id INTEGER PRIMARY KEY,
+  version INTEGER NOT NULL DEFAULT 0,
+  legs_json TEXT NOT NULL DEFAULT '[]',
+  updated_at REAL NOT NULL DEFAULT 0
+);
 """
 
 
@@ -339,6 +417,13 @@ def _migrate(con):
             con.execute(f"ALTER TABLE items ADD COLUMN {col} INTEGER NOT NULL DEFAULT {dflt}")
             con.execute(
                 f"UPDATE items SET {col}=0 WHERE kind='prop'")
+    # 侧台通行：换装位/服装车吸附到路网节点（NULL=按坐标就近吸附）
+    pcols = {r["name"] for r in con.execute("PRAGMA table_info(positions)")}
+    if pcols and "node_id" not in pcols:
+        con.execute("ALTER TABLE positions ADD COLUMN node_id INTEGER")
+    ccols = {r["name"] for r in con.execute("PRAGMA table_info(carts)")}
+    if ccols and "node_id" not in ccols:
+        con.execute("ALTER TABLE carts ADD COLUMN node_id INTEGER")
     con.commit()
 
 
@@ -410,7 +495,23 @@ def load_state(production_id=1):
                 "SELECT id,production_id,name,status,source_kind,source_id,evening_offset_sec,"
                 "created_at,archived_at FROM turnarounds WHERE production_id=? ORDER BY id DESC",
                 (pid,)),
+            "net_nodes": rows(con,
+                "SELECT * FROM net_nodes WHERE production_id=? ORDER BY id", (pid,)),
+            "net_edges": rows(con,
+                "SELECT * FROM net_edges WHERE production_id=? ORDER BY id", (pid,)),
+            "net_closures": rows(con,
+                "SELECT * FROM net_closures WHERE production_id=? ORDER BY id", (pid,)),
+            "net_zones": rows(con,
+                "SELECT * FROM net_zones WHERE production_id=? ORDER BY id", (pid,)),
+            "net_exits": rows(con,
+                "SELECT * FROM net_exits WHERE production_id=?", (pid,)),
+            "net_paths": rows(con,
+                "SELECT * FROM net_paths WHERE production_id=? ORDER BY id", (pid,)),
+            "net_yields": rows(con,
+                "SELECT * FROM net_yields WHERE production_id=? ORDER BY id", (pid,)),
         }
+        nm = row(con, "SELECT version FROM net_meta WHERE production_id=?", (pid,))
+        state["net_version"] = nm["version"] if nm else 0
         look_ids = {l["id"] for l in state["looks"]}
         state["look_items"] = [li for li in state["look_items"] if li["look_id"] in look_ids]
         dr_ids = {d["id"] for d in state["dressers"]}
@@ -466,6 +567,18 @@ def snapshot(production_id=1):
             "copy_fit": rows(con,
                 "SELECT cf.* FROM copy_fit cf JOIN item_copies ic ON ic.id=cf.copy_id "
                 "WHERE ic.production_id=? ORDER BY cf.copy_id,cf.dim", (pid,)),
+            # 侧台通行路网：版本、路网、人工计划（拖改路径/让行）与逐段时刻随修订留存
+            "net_nodes": rows(con, "SELECT * FROM net_nodes WHERE production_id=?", (pid,)),
+            "net_edges": rows(con, "SELECT * FROM net_edges WHERE production_id=?", (pid,)),
+            "net_closures": rows(con, "SELECT * FROM net_closures WHERE production_id=?", (pid,)),
+            "net_zones": rows(con, "SELECT * FROM net_zones WHERE production_id=?", (pid,)),
+            "net_exits": rows(con, "SELECT * FROM net_exits WHERE production_id=?", (pid,)),
+            "net_paths": rows(con, "SELECT * FROM net_paths WHERE production_id=?", (pid,)),
+            "net_yields": rows(con, "SELECT * FROM net_yields WHERE production_id=?", (pid,)),
+            "net_version": (row(con, "SELECT version FROM net_meta WHERE production_id=?",
+                                (pid,)) or {"version": 0})["version"],
+            "net_sim": row(con, "SELECT version,legs_json,updated_at FROM net_sim "
+                                "WHERE production_id=?", (pid,)),
         }
     finally:
         con.close()
@@ -547,6 +660,32 @@ def restore_revision(rev_id):
                 con.execute(
                     f"INSERT INTO {table}({','.join(cols)}) VALUES({','.join('?' for _ in cols)})",
                     [r[c] for c in cols])
+        # 侧台通行路网（含人工计划与版本）：旧修订无这些键则跳过
+        for table in ("net_nodes", "net_edges", "net_closures", "net_zones",
+                      "net_exits", "net_paths", "net_yields"):
+            if table not in snap:
+                continue
+            con.execute(f"DELETE FROM {table} WHERE production_id=?", (pid,))
+            for r in snap[table]:
+                cols = [c for c in r.keys() if c != "id"]
+                con.execute(
+                    f"INSERT INTO {table}(id,{','.join(cols)}) VALUES(?{',?'*len(cols)})",
+                    [r.get("id")] + [r[c] for c in cols],
+                )
+        if "net_version" in snap:
+            con.execute(
+                "INSERT INTO net_meta(production_id,version) VALUES(?,?) "
+                "ON CONFLICT(production_id) DO UPDATE SET version=excluded.version",
+                (pid, int(snap["net_version"] or 0)))
+        if snap.get("net_sim"):
+            ns = snap["net_sim"]
+            con.execute(
+                "INSERT INTO net_sim(production_id,version,legs_json,updated_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(production_id) DO UPDATE SET "
+                "version=excluded.version,legs_json=excluded.legs_json,"
+                "updated_at=excluded.updated_at",
+                (pid, int(ns.get("version") or 0), ns.get("legs_json") or "[]",
+                 float(ns.get("updated_at") or 0)))
         con.commit()
         return True
     finally:
@@ -928,6 +1067,49 @@ def delete_care_resource(pid, rid):
         con.execute("UPDATE care_steps SET resource_id=NULL "
                     "WHERE resource_id=? AND production_id=?", (rid, pid))
         con.execute("DELETE FROM care_resources WHERE id=? AND production_id=?", (rid, pid))
+        con.commit()
+    finally:
+        con.close()
+
+
+# ---------------- 侧台通行推演 ----------------
+
+def bump_net_version(pid=1):
+    """路网变更：版本号递增（随修订快照留存）。"""
+    con = connect()
+    try:
+        con.execute(
+            "INSERT INTO net_meta(production_id,version) VALUES(?,1) "
+            "ON CONFLICT(production_id) DO UPDATE SET version=version+1", (pid,))
+        con.commit()
+        return row(con, "SELECT version FROM net_meta WHERE production_id=?",
+                   (pid,))["version"]
+    finally:
+        con.close()
+
+
+def get_net_sim(pid=1):
+    con = connect()
+    try:
+        return row(con, "SELECT * FROM net_sim WHERE production_id=?", (pid,))
+    finally:
+        con.close()
+
+
+def save_net_sim(pid, version, legs):
+    """留存最近一次通行推演的逐段时刻（内容不变则不写）。"""
+    payload = json.dumps(legs, ensure_ascii=False)
+    con = connect()
+    try:
+        cur = row(con, "SELECT version,legs_json FROM net_sim WHERE production_id=?", (pid,))
+        if cur and cur["version"] == version and cur["legs_json"] == payload:
+            return
+        con.execute(
+            "INSERT INTO net_sim(production_id,version,legs_json,updated_at) "
+            "VALUES(?,?,?,?) ON CONFLICT(production_id) DO UPDATE SET "
+            "version=excluded.version,legs_json=excluded.legs_json,"
+            "updated_at=excluded.updated_at",
+            (pid, int(version), payload, time.time()))
         con.commit()
     finally:
         con.close()
